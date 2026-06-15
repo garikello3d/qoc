@@ -9,13 +9,8 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 
-const REQUIRED_BINARIES: &[&str] = &[
-    "virtiofsd",
-    "qemu-system-x86_64",
-    "fakeroot",
-    "debootstrap",
-    "proot",
-];
+mod distro;
+pub use distro::{Arch, Debian, Distro};
 
 const NIC_MODELS: &[&str] = &[
     "virtio-net-pci",
@@ -34,8 +29,10 @@ const NIC_MODELS: &[&str] = &[
     "pcnet",
 ];
 
-pub fn create(rootfs: PathBuf) -> Result<()> {
-    for binary in REQUIRED_BINARIES {
+pub fn create(distro: &dyn Distro, rootfs: PathBuf) -> Result<()> {
+    let mut binaries = vec!["proot"];
+    binaries.extend_from_slice(distro.extra_binaries());
+    for binary in &binaries {
         if !binary_in_path(binary) {
             bail!("required binary not found in PATH: {binary}");
         }
@@ -45,55 +42,50 @@ pub fn create(rootfs: PathBuf) -> Result<()> {
         bail!("rootfs path already exists: {}", rootfs.display());
     }
 
-    let rootfs_str = rootfs.to_str().context("rootfs path is not valid UTF-8")?;
+    println!("creating {} rootfs at {}", distro.name(), rootfs.display());
 
-    let status = Command::new("fakeroot")
-        .args([
-            "debootstrap",
-            "--foreign",
-            "--include=linux-image-amd64,initramfs-tools,openssh-server,systemd-sysv,systemd-resolved,dbus,locales,ethtool,firmware-linux-nonfree,firmware-misc-nonfree",
-            "--components=main,contrib,non-free-firmware",
-            "--arch=amd64",
-            "bookworm",
-            rootfs_str,
-            "http://deb.debian.org/debian",
-        ])
-        .status()
-        .context("failed to spawn fakeroot debootstrap")?;
+    distro.bootstrap(&rootfs)?;
 
-    if !status.success() {
-        bail!("debootstrap first stage failed");
-    }
-
-    // Raw string keeps \n as literal backslash-n for printf format strings inside the chroot.
-    let proot_script = r#"export PATH=/usr/bin:/usr/sbin:/bin:/sbin
-/debootstrap/debootstrap --second-stage
-printf 'virtio\nvirtio_pci\nvirtiofs\n' >> /etc/initramfs-tools/modules
-update-initramfs -c -u -k all
-echo 'root:1111' | chpasswd
-echo 'debian-vm' > /etc/hostname
-printf '[Match]\nName=en*\n[Network]\nDHCP=yes\n' > /etc/systemd/network/01-all.network
-systemctl enable ssh
-systemctl enable systemd-networkd
-systemctl enable systemd-resolved
-echo 'en_GB.UTF-8 UTF-8' >> /etc/locale.gen
-locale-gen"#;
-
-    let status = Command::new("proot")
-        .args(["-0", "-r", rootfs_str, "/bin/bash", "-c", proot_script])
-        .status()
-        .context("failed to spawn proot")?;
-
-    if !status.success() {
-        bail!("proot second stage failed");
-    }
+    run_proot(&rootfs, distro.proot_binds(), &distro.configure_script())?;
 
     install_ssh_key(&rootfs).context("failed to install SSH public key")?;
 
     Ok(())
 }
 
-pub fn run(rootfs: PathBuf, nr_network_cards: usize, show_log: bool) -> Result<()> {
+// Runs `script` inside the rootfs via proot acting as root. The shared preamble
+// makes the script fail fast (`set -e`) and fixes PATH. `binds` are passed as
+// `-b <path>`; they are per-distro because Debian's debootstrap second stage
+// aborts proot (compare_paths2 assertion) when /dev,/proc,/sys are bound.
+fn run_proot(rootfs: &Path, binds: &[&str], script: &str) -> Result<()> {
+    let rootfs_str = rootfs.to_str().context("rootfs path is not valid UTF-8")?;
+    let full = format!("set -e\nexport PATH=/usr/bin:/usr/sbin:/bin:/sbin\n{script}");
+
+    let mut args: Vec<&str> = Vec::new();
+    for bind in binds {
+        args.push("-b");
+        args.push(bind);
+    }
+    args.extend(["-0", "-r", rootfs_str, "/bin/bash", "-c", &full]);
+
+    let status = Command::new("proot")
+        .args(&args)
+        .status()
+        .context("failed to spawn proot")?;
+
+    if !status.success() {
+        bail!("proot configuration stage failed");
+    }
+    Ok(())
+}
+
+pub fn run(distro: &dyn Distro, rootfs: PathBuf, nr_network_cards: usize, show_log: bool) -> Result<()> {
+    for binary in ["virtiofsd", "qemu-system-x86_64"] {
+        if !binary_in_path(binary) {
+            bail!("required binary not found in PATH: {binary}");
+        }
+    }
+
     if nr_network_cards == 0 {
         bail!("nr_network_cards must be at least 1");
     }
@@ -105,8 +97,8 @@ pub fn run(rootfs: PathBuf, nr_network_cards: usize, show_log: bool) -> Result<(
     }
 
     let rootfs_str = rootfs.to_str().context("rootfs path is not valid UTF-8")?;
-    let vmlinuz = find_boot_file(&rootfs, "vmlinuz-")?;
-    let initrd = find_boot_file(&rootfs, "initrd.img-")?;
+    let vmlinuz = find_boot_file(&rootfs, distro.kernel_prefix())?;
+    let initrd = find_boot_file(&rootfs, distro.initramfs_prefix())?;
     let vmlinuz_str = vmlinuz.to_str().context("vmlinuz path is not valid UTF-8")?;
     let initrd_str = initrd.to_str().context("initrd path is not valid UTF-8")?;
 
