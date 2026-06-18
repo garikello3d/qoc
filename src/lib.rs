@@ -37,6 +37,12 @@ pub struct VmInfo {
     pub kernel_config: Option<String>,
 }
 
+pub struct SshOutput {
+    pub stdout: String,
+    pub stderr: String,
+    pub success: bool,
+}
+
 /// Handle to a running VM. Dropping this terminates the VM.
 pub struct VmHandle {
     /// Host-side SSH port forwarded to guest port 22.
@@ -65,6 +71,18 @@ impl VmHandle {
             t.join().ok();
         }
         Ok(())
+    }
+
+    /// Run an arbitrary command on the guest and return its output.
+    /// Call [`VmHandle::wait_for_info`] first to ensure the VM is up.
+    pub fn ssh(&self, remote_args: &[&str]) -> Result<SshOutput> {
+        let out = ssh_exec(self.ssh_port, remote_args)
+            .context("failed to spawn ssh")?;
+        Ok(SshOutput {
+            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+            success: out.status.success(),
+        })
     }
 
     /// Send SIGTERM to QEMU and wait for full cleanup.
@@ -223,21 +241,13 @@ pub fn start(
         thread::sleep(Duration::from_secs(1));
 
         const MAX_SSH_ATTEMPTS: u32 = 10;
-        let ssh_port_str = ssh_port.to_string();
-        let probe_args = [
-            "-p", &ssh_port_str,
-            "-o", "StrictHostKeyChecking=no",
-            "-o", "UserKnownHostsFile=/dev/null",
-            "root@localhost",
-            "cat", "/proc/version",
-        ];
 
         let mut proc_version: Option<String> = None;
         for attempt in 1..=MAX_SSH_ATTEMPTS {
             if show_log {
                 println!("ssh attempt {attempt}/{MAX_SSH_ATTEMPTS}");
             }
-            let out = match Command::new("ssh").args(probe_args).output() {
+            let out = match ssh_exec(ssh_port, &["cat", "/proc/version"]) {
                 Ok(o) => o,
                 Err(e) => {
                     let _ = info_tx.send(Err(anyhow::anyhow!("failed to spawn ssh: {e}")));
@@ -267,7 +277,7 @@ pub fn start(
             .and_then(|s| kver_re.captures(s))
             .map(|c| c[1].to_string());
 
-        let kernel_config = fetch_kernel_config(&ssh_port_str, kernel_version.as_deref());
+        let kernel_config = fetch_kernel_config(ssh_port, kernel_version.as_deref());
 
         println!("VM is up — connect with: ssh -p {ssh_port} root@localhost");
         println!("kernel version: {}", kernel_version.as_deref().unwrap_or("unknown"));
@@ -339,9 +349,10 @@ fn run_proot(rootfs: &Path, binds: &[&str], script: &str) -> Result<()> {
     Ok(())
 }
 
-fn ssh_exec(port_str: &str, remote_args: &[&str]) -> std::io::Result<std::process::Output> {
+fn ssh_exec(port: u16, remote_args: &[&str]) -> std::io::Result<std::process::Output> {
+    let port_str = port.to_string();
     let mut args = vec![
-        "-p", port_str,
+        "-p", &port_str,
         "-o", "StrictHostKeyChecking=no",
         "-o", "UserKnownHostsFile=/dev/null",
         "root@localhost",
@@ -350,11 +361,11 @@ fn ssh_exec(port_str: &str, remote_args: &[&str]) -> std::io::Result<std::proces
     Command::new("ssh").args(&args).output()
 }
 
-fn fetch_kernel_config(port_str: &str, kver: Option<&str>) -> Option<String> {
+fn fetch_kernel_config(port: u16, kver: Option<&str>) -> Option<String> {
     // Prefer /proc/config.gz if the kernel was built with CONFIG_IKCONFIG_PROC.
-    if let Ok(out) = ssh_exec(port_str, &["test", "-f", "/proc/config.gz"]) {
+    if let Ok(out) = ssh_exec(port, &["test", "-f", "/proc/config.gz"]) {
         if out.status.success() {
-            if let Ok(gz) = ssh_exec(port_str, &["zcat", "/proc/config.gz"]) {
+            if let Ok(gz) = ssh_exec(port, &["zcat", "/proc/config.gz"]) {
                 if gz.status.success() {
                     return Some(String::from_utf8_lossy(&gz.stdout).into_owned());
                 }
@@ -365,13 +376,13 @@ fn fetch_kernel_config(port_str: &str, kver: Option<&str>) -> Option<String> {
 
     // Fall back to /boot/config-<kver>.
     let kver = kver?;
-    let ls_out = ssh_exec(port_str, &["ls", "/boot/config-*"]).ok()?;
+    let ls_out = ssh_exec(port, &["ls", "/boot/config-*"]).ok()?;
     if !ls_out.status.success() {
         return None;
     }
     let listing = String::from_utf8_lossy(&ls_out.stdout);
     let path = listing.lines().find(|l| l.contains(kver))?.trim().to_string();
-    let cat = ssh_exec(port_str, &["cat", &path]).ok()?;
+    let cat = ssh_exec(port, &["cat", &path]).ok()?;
     if cat.status.success() {
         Some(String::from_utf8_lossy(&cat.stdout).into_owned())
     } else {
