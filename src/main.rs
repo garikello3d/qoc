@@ -57,11 +57,12 @@ enum Commands {
 
 fn main() {
     let cli = Cli::parse();
-    let result = match cli.command {
+    let result: Result<(), _> = match cli.command {
         Commands::Create { rootfs, distro } => qoc::create(distro.build().as_ref(), rootfs),
         Commands::Run { rootfs, nr_network_cards, show_log } => {
             qoc::detect_distro(&rootfs)
                 .and_then(|distro| qoc::run(distro.as_ref(), rootfs, nr_network_cards, show_log))
+                .map(|_| ())
         }
     };
     if let Err(e) = result {

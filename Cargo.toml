@@ -16,3 +16,4 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 ctrlc = "3"
 libc = "0.2"
+regex = "1"

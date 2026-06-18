@@ -9,6 +9,7 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
+use regex::Regex;
 
 mod distro;
 pub use distro::{Arch, Debian, Distro};
@@ -29,6 +30,11 @@ const NIC_MODELS: &[&str] = &[
     "ne2k_pci",
     "pcnet",
 ];
+
+pub struct VmInfo {
+    pub kernel_version: Option<String>,
+    pub kernel_config: Option<String>,
+}
 
 pub fn create(distro: &dyn Distro, rootfs: PathBuf) -> Result<()> {
     let mut binaries = vec!["proot"];
@@ -80,7 +86,7 @@ fn run_proot(rootfs: &Path, binds: &[&str], script: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn run(distro: &dyn Distro, rootfs: PathBuf, nr_network_cards: usize, show_log: bool) -> Result<()> {
+pub fn run(distro: &dyn Distro, rootfs: PathBuf, nr_network_cards: usize, show_log: bool) -> Result<VmInfo> {
     for binary in ["virtiofsd", "qemu-system-x86_64"] {
         if !binary_in_path(binary) {
             bail!("required binary not found in PATH: {binary}");
@@ -188,30 +194,31 @@ pub fn run(distro: &dyn Distro, rootfs: PathBuf, nr_network_cards: usize, show_l
 
     const MAX_SSH_ATTEMPTS: u32 = 10;
     let ssh_port_str = ssh_port.to_string();
-    let ssh_args = [
+    let probe_args = [
         "-p", &ssh_port_str,
         "-o", "StrictHostKeyChecking=no",
         "-o", "UserKnownHostsFile=/dev/null",
         "root@localhost",
-        "ip", "-br", "a",
+        "cat", "/proc/version",
     ];
 
-    let mut success = false;
+    let mut proc_version: Option<String> = None;
     for attempt in 1..=MAX_SSH_ATTEMPTS {
         if show_log {
-            println!("ssh attempt {attempt}/{MAX_SSH_ATTEMPTS}: ssh {}", ssh_args.join(" "));
+            println!("ssh attempt {attempt}/{MAX_SSH_ATTEMPTS}");
         }
         let out = Command::new("ssh")
-            .args(ssh_args)
+            .args(probe_args)
             .output()
             .context("failed to spawn ssh")?;
         if out.status.success() {
-            println!("VM is up (ssh {})\n{}", ssh_args.join(" "), String::from_utf8_lossy(&out.stdout));
-            success = true;
+            proc_version = Some(String::from_utf8_lossy(&out.stdout).into_owned());
             break;
         }
         thread::sleep(Duration::from_secs(1));
     }
+
+    let success = proc_version.is_some();
 
     if !success {
         unsafe { libc::kill(qemu_pid, libc::SIGTERM) };
@@ -220,9 +227,21 @@ pub fn run(distro: &dyn Distro, rootfs: PathBuf, nr_network_cards: usize, show_l
         bail!("VM did not become reachable after {MAX_SSH_ATTEMPTS} SSH attempts");
     }
 
+    let kver_re = Regex::new(r"Linux version ([A-Za-z0-9._-]+) \(").unwrap();
+    let kernel_version: Option<String> = proc_version
+        .as_deref()
+        .and_then(|s| kver_re.captures(s))
+        .map(|c| c[1].to_string());
+
+    let kernel_config = fetch_kernel_config(&ssh_port_str, kernel_version.as_deref());
+
+    println!("VM is up — connect with: ssh -p {ssh_port} root@localhost");
+    println!("kernel version: {}", kernel_version.as_deref().unwrap_or("unknown"));
+    println!("kernel config: {}", if kernel_config.is_some() { "extracted" } else { "not available" });
+
     qemu.wait().context("waiting for QEMU")?;
     virtiofsd_child.wait().context("waiting for virtiofsd")?;
-    Ok(())
+    Ok(VmInfo { kernel_version, kernel_config })
 }
 
 pub fn detect_distro(rootfs: &Path) -> Result<Box<dyn Distro>> {
@@ -251,6 +270,46 @@ pub fn detect_distro(rootfs: &Path) -> Result<Box<dyn Distro>> {
         "debian" => Ok(Box::new(Debian)),
         "arch" => Ok(Box::new(Arch)),
         other => bail!("unrecognised distro ID {:?} in {}", other, os_release.display()),
+    }
+}
+
+fn ssh_exec(port_str: &str, remote_args: &[&str]) -> std::io::Result<std::process::Output> {
+    let mut args = vec![
+        "-p", port_str,
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile=/dev/null",
+        "root@localhost",
+    ];
+    args.extend_from_slice(remote_args);
+    Command::new("ssh").args(&args).output()
+}
+
+fn fetch_kernel_config(port_str: &str, kver: Option<&str>) -> Option<String> {
+    // Prefer /proc/config.gz if the kernel was built with CONFIG_IKCONFIG_PROC.
+    if let Ok(out) = ssh_exec(port_str, &["test", "-f", "/proc/config.gz"]) {
+        if out.status.success() {
+            if let Ok(gz) = ssh_exec(port_str, &["zcat", "/proc/config.gz"]) {
+                if gz.status.success() {
+                    return Some(String::from_utf8_lossy(&gz.stdout).into_owned());
+                }
+            }
+            return None;
+        }
+    }
+
+    // Fall back to /boot/config-<kver>.
+    let kver = kver?;
+    let ls_out = ssh_exec(port_str, &["ls", "/boot/config-*"]).ok()?;
+    if !ls_out.status.success() {
+        return None;
+    }
+    let listing = String::from_utf8_lossy(&ls_out.stdout);
+    let path = listing.lines().find(|l| l.contains(kver))?.trim().to_string();
+    let cat = ssh_exec(port_str, &["cat", &path]).ok()?;
+    if cat.status.success() {
+        Some(String::from_utf8_lossy(&cat.stdout).into_owned())
+    } else {
+        None
     }
 }
 
