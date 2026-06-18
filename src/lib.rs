@@ -1,9 +1,10 @@
 use std::env;
 use std::fs;
 use std::io::{BufRead, BufReader};
+use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{self, Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
@@ -104,9 +105,12 @@ pub fn run(distro: &dyn Distro, rootfs: PathBuf, nr_network_cards: usize, show_l
 
     let log_stdio = || if show_log { Stdio::inherit() } else { Stdio::null() };
 
+    let ssh_port = find_free_port().context("failed to find a free SSH host port")?;
+    let socket_path = format!("/tmp/vhost-fs-{}.sock", process::id());
+
     let mut virtiofsd_child = Command::new("virtiofsd")
         .args([
-            "--socket-path=/tmp/vhost-fs.sock",
+            &format!("--socket-path={socket_path}"),
             &format!("--shared-dir={rootfs_str}"),
             "--uid-map=:0:1000:1:",
             "--uid-map=:1:100000:65535:",
@@ -128,7 +132,7 @@ pub fn run(distro: &dyn Distro, rootfs: PathBuf, nr_network_cards: usize, show_l
         "-m".into(), "2G".into(),
         "-object".into(), "memory-backend-memfd,id=mem,size=2G,share=on".into(),
         "-numa".into(), "node,memdev=mem".into(),
-        "-chardev".into(), "socket,id=char0,path=/tmp/vhost-fs.sock".into(),
+        "-chardev".into(), format!("socket,id=char0,path={socket_path}"),
         "-device".into(), "vhost-user-fs-pci,queue-size=1024,chardev=char0,tag=rootfs".into(),
         "-kernel".into(), vmlinuz_str.into(),
         "-initrd".into(), initrd_str.into(),
@@ -141,7 +145,7 @@ pub fn run(distro: &dyn Distro, rootfs: PathBuf, nr_network_cards: usize, show_l
         let mac = format!("52:54:00:11:22:{i:02x}");
         let subnet = format!("10.0.{}.0/24", i + 2);
         let netdev = if i == 0 {
-            format!("user,id={net_id},net={subnet},hostfwd=tcp::40022-:22")
+            format!("user,id={net_id},net={subnet},hostfwd=tcp::{ssh_port}-:22")
         } else {
             format!("user,id={net_id},net={subnet}")
         };
@@ -183,8 +187,9 @@ pub fn run(distro: &dyn Distro, rootfs: PathBuf, nr_network_cards: usize, show_l
     thread::sleep(Duration::from_secs(1));
 
     const MAX_SSH_ATTEMPTS: u32 = 10;
+    let ssh_port_str = ssh_port.to_string();
     let ssh_args = [
-        "-p", "40022",
+        "-p", &ssh_port_str,
         "-o", "StrictHostKeyChecking=no",
         "-o", "UserKnownHostsFile=/dev/null",
         "root@localhost",
@@ -220,6 +225,11 @@ pub fn run(distro: &dyn Distro, rootfs: PathBuf, nr_network_cards: usize, show_l
     Ok(())
 }
 
+fn find_free_port() -> Result<u16> {
+    let listener = TcpListener::bind("127.0.0.1:0").context("failed to bind TCP listener")?;
+    Ok(listener.local_addr().context("failed to get local address")?.port())
+}
+
 fn binary_in_path(name: &str) -> bool {
     let Some(path) = env::var_os("PATH") else {
         return false;
@@ -237,6 +247,7 @@ fn binary_in_path(name: &str) -> bool {
 fn install_ssh_key(rootfs: &Path) -> Result<()> {
     let home = PathBuf::from(env::var("HOME").context("HOME not set")?);
 
+    // corresponds to the ssh client tool order
     let pubkey_path = ["rsa", "ecdsa", "ecdsa_sk", "ed25519", "ed25519_sk"]
         .iter()
         .map(|t| home.join(".ssh").join(format!("id_{t}.pub")))
