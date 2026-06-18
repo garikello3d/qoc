@@ -4,9 +4,9 @@ Spinning up a VM usually means fighting `sudo`, editing `/etc/sudoers`, or convi
 
 Inspired by [virtme-ng](https://github.com/arighi/virtme-ng).
 
-`qoc create` builds a rootfs on the host using `proot` + `debootstrap` / `pacstrap`. `qoc run` boots it inside QEMU (KVM) with the rootfs exposed via virtiofs, waits for SSH, and leaves you with a live shell target on port 40022.
+`qoc create` builds a rootfs on the host using `proot` + `debootstrap` / `pacstrap`. `qoc run` boots it inside QEMU (KVM) with the rootfs exposed via virtiofs, waits for SSH, and leaves you with a live shell target. The SSH host port is picked automatically so multiple VMs can run side by side.
 
-Your `~/.ssh/id_*.pub` key is injected during create, so `ssh -p 40022 root@localhost` works without a password the moment the VM is up.
+Your `~/.ssh/id_*.pub` key is injected during create, so passwordless SSH works the moment the VM is up.
 
 ## Supported distros
 
@@ -40,11 +40,11 @@ cargo build --release
 # 1. Create the rootfs (takes a few minutes)
 qoc create --rootfs ~/vms/debian-test --distro debian
 
-# 2. Boot it
-qoc run --rootfs ~/vms/debian-test --distro debian
+# 2. Boot it (distro is auto-detected)
+qoc run --rootfs ~/vms/debian-test
 
-# VM is up — in another terminal:
-ssh -p 40022 root@localhost
+# VM is up — port is printed in the "VM is up" line, e.g.:
+ssh -p <port> root@localhost
 ```
 
 ### Arch Linux VM with multiple NICs
@@ -54,13 +54,13 @@ ssh -p 40022 root@localhost
 qoc create --rootfs ~/vms/arch-net --distro arch
 
 # 2. Boot with 4 emulated NICs (virtio-net, igb, e1000, rtl8139)
-qoc run --rootfs ~/vms/arch-net --distro arch --nr-network-cards 4
+qoc run --rootfs ~/vms/arch-net --nr-network-cards 4
 
-# Inspect all interfaces from the host
-ssh -p 40022 -o StrictHostKeyChecking=no root@localhost ip -br a
+# Inspect all interfaces from the host (use the port printed at startup)
+ssh -p <port> -o StrictHostKeyChecking=no root@localhost ip -br a
 ```
 
-Each NIC gets its own `/24` subnet starting at `10.0.2.0/24`; the first card also carries the SSH forward (`host:40022 → guest:22`).
+Each NIC gets its own `/24` subnet starting at `10.0.2.0/24`; the first card also carries the SSH forward to `guest:22` on an automatically chosen host port.
 
 ## Options
 
@@ -71,7 +71,6 @@ qoc create
 
 qoc run
   -r, --rootfs <PATH>     directory created by 'create'
-      --distro <DISTRO>   debian | arch
   -n, --nr-network-cards  emulated NICs 1–14 (default: 1)
       --show-log          print virtiofsd and QEMU output
 ```

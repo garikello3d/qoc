@@ -39,15 +39,11 @@ enum Commands {
         #[arg(long, value_enum)]
         distro: DistroKind,
     },
-    /// Run a VM mounting an existing rootfs
+    /// Run a VM mounting an existing rootfs (distro is auto-detected from etc/os-release)
     Run {
         /// Path to the rootfs directory created by `create`
         #[arg(short, long)]
         rootfs: PathBuf,
-
-        /// Which distribution the rootfs was created as (determines boot-file names)
-        #[arg(long, value_enum)]
-        distro: DistroKind,
 
         /// Number of emulated network cards (1–14)
         #[arg(short, long, default_value_t = 1)]
@@ -63,8 +59,9 @@ fn main() {
     let cli = Cli::parse();
     let result = match cli.command {
         Commands::Create { rootfs, distro } => qoc::create(distro.build().as_ref(), rootfs),
-        Commands::Run { rootfs, distro, nr_network_cards, show_log } => {
-            qoc::run(distro.build().as_ref(), rootfs, nr_network_cards, show_log)
+        Commands::Run { rootfs, nr_network_cards, show_log } => {
+            qoc::detect_distro(&rootfs)
+                .and_then(|distro| qoc::run(distro.as_ref(), rootfs, nr_network_cards, show_log))
         }
     };
     if let Err(e) = result {

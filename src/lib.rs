@@ -225,6 +225,35 @@ pub fn run(distro: &dyn Distro, rootfs: PathBuf, nr_network_cards: usize, show_l
     Ok(())
 }
 
+pub fn detect_distro(rootfs: &Path) -> Result<Box<dyn Distro>> {
+    let os_release = rootfs.join("etc/os-release");
+    let content = fs::read_to_string(&os_release)
+        .with_context(|| format!("failed to read {}", os_release.display()))?;
+
+    let id = content
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.starts_with('#') {
+                return None;
+            }
+            let (key, val) = line.split_once('=')?;
+            if key.trim() == "ID" {
+                Some(val.trim().trim_matches('"').trim_matches('\'').to_string())
+            } else {
+                None
+            }
+        })
+        .next()
+        .with_context(|| format!("no ID field found in {}", os_release.display()))?;
+
+    match id.as_str() {
+        "debian" => Ok(Box::new(Debian)),
+        "arch" => Ok(Box::new(Arch)),
+        other => bail!("unrecognised distro ID {:?} in {}", other, os_release.display()),
+    }
+}
+
 fn find_free_port() -> Result<u16> {
     let listener = TcpListener::bind("127.0.0.1:0").context("failed to bind TCP listener")?;
     Ok(listener.local_addr().context("failed to get local address")?.port())
