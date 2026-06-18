@@ -34,6 +34,7 @@ const NIC_MODELS: &[&str] = &[
 
 pub struct VmInfo {
     pub kernel_version: Option<String>,
+    pub upstream_version: Option<String>,
     pub kernel_config: Option<String>,
 }
 
@@ -277,14 +278,32 @@ pub fn start(
             .and_then(|s| kver_re.captures(s))
             .map(|c| c[1].to_string());
 
+        // Debian embeds the upstream stable version in a trailing "Debian X.Y.Z-N (" token.
+        // For other distros (e.g. Arch), strip the distro suffix from kernel_version directly.
+        let debian_re = Regex::new(r"\bDebian\s+([0-9]+\.[0-9]+\.[0-9]+)-[0-9]+\s+\(").unwrap();
+        let numeric_re = Regex::new(r"^([0-9]+\.[0-9]+\.[0-9]+)").unwrap();
+        let upstream_version: Option<String> = proc_version
+            .as_deref()
+            .and_then(|s| debian_re.captures(s))
+            .map(|c| c[1].to_string())
+            .or_else(|| {
+                kernel_version.as_deref()
+                    .and_then(|v| numeric_re.captures(v))
+                    .map(|c| c[1].to_string())
+            });
+
         let kernel_config = fetch_kernel_config(ssh_port, kernel_version.as_deref());
 
         println!("VM is up — connect with: ssh -p {ssh_port} root@localhost");
-        println!("kernel version: {}", kernel_version.as_deref().unwrap_or("unknown"));
+        match (kernel_version.as_deref(), upstream_version.as_deref()) {
+            (Some(kv), Some(uv)) => println!("kernel version: {kv}  (upstream: {uv})"),
+            (Some(kv), None)     => println!("kernel version: {kv}"),
+            _                    => println!("kernel version: unknown"),
+        }
         println!("kernel config: {}", if kernel_config.is_some() { "extracted" } else { "not available" });
 
         // Deliver VmInfo to the caller; channel is done after this send.
-        let _ = info_tx.send(Ok(VmInfo { kernel_version, kernel_config }));
+        let _ = info_tx.send(Ok(VmInfo { kernel_version, upstream_version, kernel_config }));
 
         // Keep running until QEMU exits (guest shutdown or external signal).
         let _ = qemu.wait();
