@@ -5,6 +5,7 @@ use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{self, Command, Stdio};
+use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
@@ -36,6 +37,55 @@ pub struct VmInfo {
     pub kernel_config: Option<String>,
 }
 
+/// Handle to a running VM. Dropping this terminates the VM.
+pub struct VmHandle {
+    /// Host-side SSH port forwarded to guest port 22.
+    pub ssh_port: u16,
+    qemu_pid: libc::pid_t,
+    info_rx: mpsc::Receiver<Result<VmInfo>>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl VmHandle {
+    pub fn qemu_pid(&self) -> libc::pid_t {
+        self.qemu_pid
+    }
+
+    /// Block until the VM is up and `VmInfo` has been collected.
+    /// The VM keeps running after this returns.
+    pub fn wait_for_info(&self) -> Result<VmInfo> {
+        self.info_rx
+            .recv()
+            .context("VM background thread exited before sending VmInfo")?
+    }
+
+    /// Block until the VM exits on its own (guest shutdown, etc.).
+    pub fn wait(mut self) -> Result<()> {
+        if let Some(t) = self.thread.take() {
+            t.join().ok();
+        }
+        Ok(())
+    }
+
+    /// Send SIGTERM to QEMU and wait for full cleanup.
+    pub fn stop(mut self) -> Result<()> {
+        unsafe { libc::kill(self.qemu_pid, libc::SIGTERM) };
+        if let Some(t) = self.thread.take() {
+            t.join().ok();
+        }
+        Ok(())
+    }
+}
+
+impl Drop for VmHandle {
+    fn drop(&mut self) {
+        unsafe { libc::kill(self.qemu_pid, libc::SIGTERM) };
+        if let Some(t) = self.thread.take() {
+            t.join().ok();
+        }
+    }
+}
+
 pub fn create(distro: &dyn Distro, rootfs: PathBuf) -> Result<()> {
     let mut binaries = vec!["proot"];
     binaries.extend_from_slice(distro.extra_binaries());
@@ -60,33 +110,17 @@ pub fn create(distro: &dyn Distro, rootfs: PathBuf) -> Result<()> {
     Ok(())
 }
 
-// Runs `script` inside the rootfs via proot acting as root. The shared preamble
-// makes the script fail fast (`set -e`) and fixes PATH. `binds` are passed as
-// `-b <path>`; they are per-distro because Debian's debootstrap second stage
-// aborts proot (compare_paths2 assertion) when /dev,/proc,/sys are bound.
-fn run_proot(rootfs: &Path, binds: &[&str], script: &str) -> Result<()> {
-    let rootfs_str = rootfs.to_str().context("rootfs path is not valid UTF-8")?;
-    let full = format!("set -e\nexport PATH=/usr/bin:/usr/sbin:/bin:/sbin\n{script}");
-
-    let mut args: Vec<&str> = Vec::new();
-    for bind in binds {
-        args.push("-b");
-        args.push(bind);
-    }
-    args.extend(["-0", "-r", rootfs_str, "/bin/bash", "-c", &full]);
-
-    let status = Command::new("proot")
-        .args(&args)
-        .status()
-        .context("failed to spawn proot")?;
-
-    if !status.success() {
-        bail!("proot configuration stage failed");
-    }
-    Ok(())
-}
-
-pub fn run(distro: &dyn Distro, rootfs: PathBuf, nr_network_cards: usize, show_log: bool) -> Result<VmInfo> {
+/// Start a VM in the background and return immediately with a [`VmHandle`].
+///
+/// The caller must use [`VmHandle::wait_for_info`] to learn when the VM is
+/// reachable and to obtain [`VmInfo`].  The VM runs until the handle is
+/// dropped, [`VmHandle::stop`] is called, or the guest shuts itself down.
+pub fn start(
+    distro: &dyn Distro,
+    rootfs: PathBuf,
+    nr_network_cards: usize,
+    show_log: bool,
+) -> Result<VmHandle> {
     for binary in ["virtiofsd", "qemu-system-x86_64"] {
         if !binary_in_path(binary) {
             bail!("required binary not found in PATH: {binary}");
@@ -170,78 +204,84 @@ pub fn run(distro: &dyn Distro, rootfs: PathBuf, nr_network_cards: usize, show_l
         .context("failed to spawn qemu-system-x86_64")?;
     println!("started qemu with {nr_network_cards} network card(s)");
 
-    // Send SIGTERM to QEMU on Ctrl-C; qemu.wait() below will then return and
-    // we proceed to wait for virtiofsd (which shuts down automatically).
     let qemu_pid = qemu.id() as libc::pid_t;
-    ctrlc::set_handler(move || {
-        unsafe { libc::kill(qemu_pid, libc::SIGTERM) };
-    })
-    .context("failed to set Ctrl-C handler")?;
+    let (info_tx, info_rx) = mpsc::channel::<Result<VmInfo>>();
 
-    // Drain QEMU stdout in a background thread; print lines only when show_log is set.
-    let stdout = qemu.stdout.take().unwrap();
-    thread::spawn(move || {
-        let reader = BufReader::new(stdout);
-        for line in reader.lines() {
-            let Ok(line) = line else { break };
-            if show_log {
-                println!("{line}");
+    let thread = thread::spawn(move || {
+        // Drain QEMU stdout in a nested thread; print only when show_log is set.
+        let stdout = qemu.stdout.take().unwrap();
+        thread::spawn(move || {
+            let reader = BufReader::new(stdout);
+            for line in reader.lines() {
+                let Ok(line) = line else { break };
+                if show_log {
+                    println!("{line}");
+                }
             }
+        });
+
+        thread::sleep(Duration::from_secs(1));
+
+        const MAX_SSH_ATTEMPTS: u32 = 10;
+        let ssh_port_str = ssh_port.to_string();
+        let probe_args = [
+            "-p", &ssh_port_str,
+            "-o", "StrictHostKeyChecking=no",
+            "-o", "UserKnownHostsFile=/dev/null",
+            "root@localhost",
+            "cat", "/proc/version",
+        ];
+
+        let mut proc_version: Option<String> = None;
+        for attempt in 1..=MAX_SSH_ATTEMPTS {
+            if show_log {
+                println!("ssh attempt {attempt}/{MAX_SSH_ATTEMPTS}");
+            }
+            let out = match Command::new("ssh").args(probe_args).output() {
+                Ok(o) => o,
+                Err(e) => {
+                    let _ = info_tx.send(Err(anyhow::anyhow!("failed to spawn ssh: {e}")));
+                    return;
+                }
+            };
+            if out.status.success() {
+                proc_version = Some(String::from_utf8_lossy(&out.stdout).into_owned());
+                break;
+            }
+            thread::sleep(Duration::from_secs(1));
         }
+
+        if proc_version.is_none() {
+            unsafe { libc::kill(qemu_pid, libc::SIGTERM) };
+            let _ = qemu.wait();
+            let _ = virtiofsd_child.wait();
+            let _ = info_tx.send(Err(anyhow::anyhow!(
+                "VM did not become reachable after {MAX_SSH_ATTEMPTS} SSH attempts"
+            )));
+            return;
+        }
+
+        let kver_re = Regex::new(r"Linux version ([A-Za-z0-9._-]+) \(").unwrap();
+        let kernel_version: Option<String> = proc_version
+            .as_deref()
+            .and_then(|s| kver_re.captures(s))
+            .map(|c| c[1].to_string());
+
+        let kernel_config = fetch_kernel_config(&ssh_port_str, kernel_version.as_deref());
+
+        println!("VM is up — connect with: ssh -p {ssh_port} root@localhost");
+        println!("kernel version: {}", kernel_version.as_deref().unwrap_or("unknown"));
+        println!("kernel config: {}", if kernel_config.is_some() { "extracted" } else { "not available" });
+
+        // Deliver VmInfo to the caller; channel is done after this send.
+        let _ = info_tx.send(Ok(VmInfo { kernel_version, kernel_config }));
+
+        // Keep running until QEMU exits (guest shutdown or external signal).
+        let _ = qemu.wait();
+        let _ = virtiofsd_child.wait();
     });
 
-    thread::sleep(Duration::from_secs(1));
-
-    const MAX_SSH_ATTEMPTS: u32 = 10;
-    let ssh_port_str = ssh_port.to_string();
-    let probe_args = [
-        "-p", &ssh_port_str,
-        "-o", "StrictHostKeyChecking=no",
-        "-o", "UserKnownHostsFile=/dev/null",
-        "root@localhost",
-        "cat", "/proc/version",
-    ];
-
-    let mut proc_version: Option<String> = None;
-    for attempt in 1..=MAX_SSH_ATTEMPTS {
-        if show_log {
-            println!("ssh attempt {attempt}/{MAX_SSH_ATTEMPTS}");
-        }
-        let out = Command::new("ssh")
-            .args(probe_args)
-            .output()
-            .context("failed to spawn ssh")?;
-        if out.status.success() {
-            proc_version = Some(String::from_utf8_lossy(&out.stdout).into_owned());
-            break;
-        }
-        thread::sleep(Duration::from_secs(1));
-    }
-
-    let success = proc_version.is_some();
-
-    if !success {
-        unsafe { libc::kill(qemu_pid, libc::SIGTERM) };
-        qemu.wait().context("waiting for QEMU")?;
-        virtiofsd_child.wait().context("waiting for virtiofsd")?;
-        bail!("VM did not become reachable after {MAX_SSH_ATTEMPTS} SSH attempts");
-    }
-
-    let kver_re = Regex::new(r"Linux version ([A-Za-z0-9._-]+) \(").unwrap();
-    let kernel_version: Option<String> = proc_version
-        .as_deref()
-        .and_then(|s| kver_re.captures(s))
-        .map(|c| c[1].to_string());
-
-    let kernel_config = fetch_kernel_config(&ssh_port_str, kernel_version.as_deref());
-
-    println!("VM is up — connect with: ssh -p {ssh_port} root@localhost");
-    println!("kernel version: {}", kernel_version.as_deref().unwrap_or("unknown"));
-    println!("kernel config: {}", if kernel_config.is_some() { "extracted" } else { "not available" });
-
-    qemu.wait().context("waiting for QEMU")?;
-    virtiofsd_child.wait().context("waiting for virtiofsd")?;
-    Ok(VmInfo { kernel_version, kernel_config })
+    Ok(VmHandle { ssh_port, qemu_pid, info_rx, thread: Some(thread) })
 }
 
 pub fn detect_distro(rootfs: &Path) -> Result<Box<dyn Distro>> {
@@ -271,6 +311,32 @@ pub fn detect_distro(rootfs: &Path) -> Result<Box<dyn Distro>> {
         "arch" => Ok(Box::new(Arch)),
         other => bail!("unrecognised distro ID {:?} in {}", other, os_release.display()),
     }
+}
+
+// Runs `script` inside the rootfs via proot acting as root. The shared preamble
+// makes the script fail fast (`set -e`) and fixes PATH. `binds` are passed as
+// `-b <path>`; they are per-distro because Debian's debootstrap second stage
+// aborts proot (compare_paths2 assertion) when /dev,/proc,/sys are bound.
+fn run_proot(rootfs: &Path, binds: &[&str], script: &str) -> Result<()> {
+    let rootfs_str = rootfs.to_str().context("rootfs path is not valid UTF-8")?;
+    let full = format!("set -e\nexport PATH=/usr/bin:/usr/sbin:/bin:/sbin\n{script}");
+
+    let mut args: Vec<&str> = Vec::new();
+    for bind in binds {
+        args.push("-b");
+        args.push(bind);
+    }
+    args.extend(["-0", "-r", rootfs_str, "/bin/bash", "-c", &full]);
+
+    let status = Command::new("proot")
+        .args(&args)
+        .status()
+        .context("failed to spawn proot")?;
+
+    if !status.success() {
+        bail!("proot configuration stage failed");
+    }
+    Ok(())
 }
 
 fn ssh_exec(port_str: &str, remote_args: &[&str]) -> std::io::Result<std::process::Output> {

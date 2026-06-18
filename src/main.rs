@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 use std::process;
 
+use anyhow::Context;
 use clap::{Parser, Subcommand, ValueEnum};
 use qoc::{Arch, Debian, Distro};
 
@@ -57,12 +58,19 @@ enum Commands {
 
 fn main() {
     let cli = Cli::parse();
-    let result: Result<(), _> = match cli.command {
+    let result = match cli.command {
         Commands::Create { rootfs, distro } => qoc::create(distro.build().as_ref(), rootfs),
         Commands::Run { rootfs, nr_network_cards, show_log } => {
-            qoc::detect_distro(&rootfs)
-                .and_then(|distro| qoc::run(distro.as_ref(), rootfs, nr_network_cards, show_log))
-                .map(|_| ())
+            qoc::detect_distro(&rootfs).and_then(|distro| {
+                let handle = qoc::start(distro.as_ref(), rootfs, nr_network_cards, show_log)?;
+                let qemu_pid = handle.qemu_pid();
+                ctrlc::set_handler(move || {
+                    unsafe { libc::kill(qemu_pid, libc::SIGTERM) };
+                })
+                .context("failed to set Ctrl-C handler")?;
+                handle.wait_for_info()?;
+                handle.wait()
+            })
         }
     };
     if let Err(e) = result {
