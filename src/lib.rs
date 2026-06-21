@@ -139,6 +139,8 @@ pub fn start(
     rootfs: PathBuf,
     nr_network_cards: usize,
     show_log: bool,
+    kernel: Option<PathBuf>,
+    initrd: Option<PathBuf>,
 ) -> Result<VmHandle> {
     for binary in ["virtiofsd", "qemu-system-x86_64"] {
         if !binary_in_path(binary) {
@@ -157,8 +159,14 @@ pub fn start(
     }
 
     let rootfs_str = rootfs.to_str().context("rootfs path is not valid UTF-8")?;
-    let vmlinuz = find_boot_file(&rootfs, distro.kernel_prefix())?;
-    let initrd = find_boot_file(&rootfs, distro.initramfs_prefix())?;
+    let vmlinuz = match kernel {
+        Some(k) => k,
+        None    => find_boot_file(&rootfs, distro.kernel_prefix())?,
+    };
+    let initrd = match initrd {
+        Some(i) => i,
+        None    => find_boot_file(&rootfs, distro.initramfs_prefix())?,
+    };
     let vmlinuz_str = vmlinuz.to_str().context("vmlinuz path is not valid UTF-8")?;
     let initrd_str = initrd.to_str().context("initrd path is not valid UTF-8")?;
 
@@ -366,6 +374,61 @@ fn run_proot(rootfs: &Path, binds: &[&str], script: &str) -> Result<()> {
         bail!("proot configuration stage failed");
     }
     Ok(())
+}
+
+// Like run_proot but captures stdout+stderr instead of inheriting them.
+// Returns combined output so callers can search both streams with a single regex.
+fn run_proot_capture(rootfs: &Path, binds: &[&str], script: &str) -> Result<String> {
+    let rootfs_str = rootfs.to_str().context("rootfs path is not valid UTF-8")?;
+    let full = format!("set -e\nexport PATH=/usr/bin:/usr/sbin:/bin:/sbin\n{script}");
+
+    let mut args: Vec<&str> = Vec::new();
+    for bind in binds {
+        args.push("-b");
+        args.push(bind);
+    }
+    args.extend(["-0", "-r", rootfs_str, "/bin/bash", "-c", &full]);
+
+    let out = Command::new("proot")
+        .args(&args)
+        .output()
+        .context("failed to spawn proot")?;
+
+    if !out.status.success() {
+        bail!(
+            "proot script failed:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    Ok(format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    ))
+}
+
+pub fn make_initrd(rootfs: &Path, kernel_version: &str) -> Result<PathBuf> {
+    let distro = detect_distro(rootfs)?;
+
+    match distro.name() {
+        "arch" => {
+            let out = format!("/boot/initramfs-{kernel_version}.img");
+            let script = format!(
+                "mkinitcpio -k {kernel_version} -c /etc/mkinitcpio.conf -g {out}"
+            );
+            run_proot(rootfs, distro.proot_binds(), &script)?;
+            Ok(PathBuf::from(out))
+        }
+        "debian" => {
+            let script = format!("update-initramfs -c -u -k {kernel_version}");
+            let captured = run_proot_capture(rootfs, distro.proot_binds(), &script)?;
+            let re = Regex::new(r"update-initramfs: Generating (/boot/\S+)").unwrap();
+            re.captures(&captured)
+                .map(|c| PathBuf::from(&c[1]))
+                .context("update-initramfs succeeded but generated path not found in output")
+        }
+        other => bail!("make_initrd: unsupported distro '{other}'"),
+    }
 }
 
 fn ssh_exec(port: u16, remote_args: &[&str]) -> std::io::Result<std::process::Output> {
