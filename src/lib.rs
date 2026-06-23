@@ -110,7 +110,7 @@ impl Drop for VmHandle {
     }
 }
 
-pub fn create(distro: &dyn Distro, rootfs: PathBuf) -> Result<()> {
+pub fn create(distro: &dyn Distro, rootfs: PathBuf) -> Result<Vec<String>> {
     let mut binaries = vec!["proot"];
     binaries.extend_from_slice(distro.extra_binaries());
     for binary in &binaries {
@@ -131,7 +131,7 @@ pub fn create(distro: &dyn Distro, rootfs: PathBuf) -> Result<()> {
 
     install_ssh_key(&rootfs).context("failed to install SSH public key")?;
 
-    Ok(())
+    list_kernels(&rootfs)
 }
 
 /// List kernel versions in `rootfs/boot/` that have exactly one paired kernel image and initrd.
@@ -173,7 +173,7 @@ pub fn start(
     nr_network_cards: usize,
     show_log: bool,
     kernel_ver: &str,
-) -> Result<VmHandle> {
+) -> Result<(VmHandle, String)> {
     for binary in ["virtiofsd", "qemu-system-x86_64"] {
         if !binary_in_path(binary) {
             bail!("required binary not found in PATH: {binary}");
@@ -256,7 +256,7 @@ pub fn start(
         .stderr(log_stdio())
         .spawn()
         .context("failed to spawn qemu-system-x86_64")?;
-    println!("started qemu with {nr_network_cards} network card(s), kernel {kernel_ver}");
+    println!("started qemu with {nr_network_cards} network card(s), chosen kernel {kernel_ver}");
 
     let qemu_pid = qemu.id() as libc::pid_t;
     let (info_tx, info_rx) = mpsc::channel::<Result<VmInfo>>();
@@ -331,9 +331,9 @@ pub fn start(
 
         println!("VM is up — connect with: ssh -p {ssh_port} root@localhost");
         match (kernel_version.as_deref(), upstream_version.as_deref()) {
-            (Some(kv), Some(uv)) => println!("kernel version: {kv}  (upstream: {uv})"),
-            (Some(kv), None)     => println!("kernel version: {kv}"),
-            _                    => println!("kernel version: unknown"),
+            (Some(kv), Some(uv)) => println!("active kernel version: {kv}  (upstream: {uv})"),
+            (Some(kv), None)     => println!("active kernel version: {kv}"),
+            _                    => println!("active kernel version: unknown"),
         }
         println!("kernel config: {}", if kernel_config.is_some() { "extracted" } else { "not available" });
 
@@ -345,7 +345,7 @@ pub fn start(
         let _ = virtiofsd_child.wait();
     });
 
-    Ok(VmHandle { ssh_port, qemu_pid, info_rx, thread: Some(thread) })
+    Ok((VmHandle { ssh_port, qemu_pid, info_rx, thread: Some(thread) }, kernel_ver.to_string()))
 }
 
 pub fn detect_distro(rootfs: &Path) -> Result<Box<dyn Distro>> {

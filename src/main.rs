@@ -83,7 +83,13 @@ fn main() {
             qoc::make_initrd(&rootfs, &kernel_version)
                 .map(|path| println!("initrd created: {}", path.display()))
         }
-        Commands::Create { rootfs, distro } => qoc::create(distro.build().as_ref(), rootfs),
+        Commands::Create { rootfs, distro } => {
+            qoc::create(distro.build().as_ref(), rootfs).map(|kernels| {
+                for v in &kernels {
+                    println!("kernel version available: {v}");
+                }
+            })
+        }
         Commands::ListKernels { rootfs } => {
             qoc::list_kernels(&rootfs).map(|kernels| {
                 for v in &kernels {
@@ -107,7 +113,8 @@ fn main() {
                         }
                     }
                 };
-                let handle = qoc::start(rootfs, nr_network_cards, show_log, &kver)?;
+                let (handle, kver) = qoc::start(rootfs, nr_network_cards, show_log, &kver)?;
+                println!("kernel version selected: {kver}");
                 let qemu_pid = handle.qemu_pid();
                 ctrlc::set_handler(move || {
                     unsafe { libc::kill(qemu_pid, libc::SIGTERM) };
