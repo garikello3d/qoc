@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::io::{BufRead, BufReader};
@@ -14,6 +15,10 @@ use regex::Regex;
 
 mod distro;
 pub use distro::{Arch, Debian, Distro};
+
+const KERNEL_BASENAMES: &[&str] = &["vmlinuz", "bzImage", "kernel", "linux"];
+const INITRD_BASENAMES: &[&str] = &["initramfs", "initrd"];
+const IMAGE_EXTENSIONS: &[&str] = &[".img", ".gz", ".zst", ".xz"];
 
 const NIC_MODELS: &[&str] = &[
     "virtio-net-pci",
@@ -129,18 +134,45 @@ pub fn create(distro: &dyn Distro, rootfs: PathBuf) -> Result<()> {
     Ok(())
 }
 
+/// List kernel versions in `rootfs/boot/` that have exactly one paired kernel image and initrd.
+pub fn list_kernels(rootfs: &Path) -> Result<Vec<String>> {
+    let boot_dir = rootfs.join("boot");
+    let mut kernel_counts: HashMap<String, usize> = HashMap::new();
+    let mut initrd_counts: HashMap<String, usize> = HashMap::new();
+
+    for entry in fs::read_dir(&boot_dir)
+        .with_context(|| format!("failed to read {}", boot_dir.display()))?
+        .filter_map(|e| e.ok())
+    {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
+        let Some((basename, version)) = split_boot_filename(name) else { continue };
+        if contains_any(basename, KERNEL_BASENAMES) {
+            *kernel_counts.entry(version.to_string()).or_insert(0) += 1;
+        } else if contains_any(basename, INITRD_BASENAMES) {
+            *initrd_counts.entry(version.to_string()).or_insert(0) += 1;
+        }
+    }
+
+    let mut result: Vec<String> = kernel_counts
+        .iter()
+        .filter(|(ver, &count)| count == 1 && initrd_counts.get(ver.as_str()) == Some(&1))
+        .map(|(ver, _)| ver.clone())
+        .collect();
+    result.sort();
+    Ok(result)
+}
+
 /// Start a VM in the background and return immediately with a [`VmHandle`].
 ///
 /// The caller must use [`VmHandle::wait_for_info`] to learn when the VM is
 /// reachable and to obtain [`VmInfo`].  The VM runs until the handle is
 /// dropped, [`VmHandle::stop`] is called, or the guest shuts itself down.
 pub fn start(
-    distro: &dyn Distro,
     rootfs: PathBuf,
     nr_network_cards: usize,
     show_log: bool,
-    kernel: Option<PathBuf>,
-    initrd: Option<PathBuf>,
+    kernel_ver: &str,
 ) -> Result<VmHandle> {
     for binary in ["virtiofsd", "qemu-system-x86_64"] {
         if !binary_in_path(binary) {
@@ -159,14 +191,9 @@ pub fn start(
     }
 
     let rootfs_str = rootfs.to_str().context("rootfs path is not valid UTF-8")?;
-    let vmlinuz = match kernel {
-        Some(k) => k,
-        None    => find_boot_file(&rootfs, distro.kernel_prefix())?,
-    };
-    let initrd = match initrd {
-        Some(i) => i,
-        None    => find_boot_file(&rootfs, distro.initramfs_prefix())?,
-    };
+    let boot_dir = rootfs.join("boot");
+    let vmlinuz = find_boot_by_version(&boot_dir, KERNEL_BASENAMES, kernel_ver)?;
+    let initrd  = find_boot_by_version(&boot_dir, INITRD_BASENAMES, kernel_ver)?;
     let vmlinuz_str = vmlinuz.to_str().context("vmlinuz path is not valid UTF-8")?;
     let initrd_str = initrd.to_str().context("initrd path is not valid UTF-8")?;
 
@@ -229,7 +256,7 @@ pub fn start(
         .stderr(log_stdio())
         .spawn()
         .context("failed to spawn qemu-system-x86_64")?;
-    println!("started qemu with {nr_network_cards} network card(s)");
+    println!("started qemu with {nr_network_cards} network card(s), kernel {kernel_ver}");
 
     let qemu_pid = qemu.id() as libc::pid_t;
     let (info_tx, info_rx) = mpsc::channel::<Result<VmInfo>>();
@@ -513,23 +540,38 @@ fn install_ssh_key(rootfs: &Path) -> Result<()> {
     Ok(())
 }
 
-// Sorts alphabetically and picks the last entry, which gives the highest kernel version.
-fn find_boot_file(rootfs: &Path, prefix: &str) -> Result<PathBuf> {
-    let boot_dir = rootfs.join("boot");
-    let mut entries: Vec<PathBuf> = fs::read_dir(&boot_dir)
+// Returns (basename, version) by splitting on the first '-' and stripping any trailing
+// file extension from the version (e.g. "initramfs-linux.img" → ("initramfs", "linux")).
+fn split_boot_filename(name: &str) -> Option<(&str, &str)> {
+    let dash = name.find('-')?;
+    let basename = &name[..dash];
+    let raw = &name[dash + 1..];
+    let version = IMAGE_EXTENSIONS.iter().find_map(|ext| raw.strip_suffix(ext)).unwrap_or(raw);
+    if version.is_empty() { None } else { Some((basename, version)) }
+}
+
+fn contains_any(s: &str, keywords: &[&str]) -> bool {
+    keywords.iter().any(|k| s.contains(k))
+}
+
+// Scans `boot_dir` for the single file whose basename contains a keyword from `basenames`
+// and whose version (right of first '-') equals `ver`. Errors if not exactly one match.
+fn find_boot_by_version(boot_dir: &Path, basenames: &[&str], ver: &str) -> Result<PathBuf> {
+    let matches: Vec<PathBuf> = fs::read_dir(boot_dir)
         .with_context(|| format!("failed to read {}", boot_dir.display()))?
         .filter_map(|e| e.ok())
         .map(|e| e.path())
         .filter(|p| {
             p.file_name()
                 .and_then(|n| n.to_str())
-                .map(|n| n.starts_with(prefix))
+                .and_then(split_boot_filename)
+                .map(|(basename, version)| contains_any(basename, basenames) && version == ver)
                 .unwrap_or(false)
         })
         .collect();
-    entries.sort();
-    entries
-        .into_iter()
-        .last()
-        .with_context(|| format!("no file matching {prefix}* in {}", boot_dir.display()))
+    match matches.as_slice() {
+        [path] => Ok(path.clone()),
+        [] => bail!("no boot file with version {ver:?} found in {}", boot_dir.display()),
+        _ => bail!("multiple boot files with version {ver:?} found in {}", boot_dir.display()),
+    }
 }

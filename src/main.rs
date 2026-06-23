@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::process;
 
-use anyhow::Context;
+use anyhow::{bail, Context};
 use clap::{Parser, Subcommand, ValueEnum};
 use qoc::{Arch, Debian, Distro};
 
@@ -50,6 +50,12 @@ enum Commands {
         #[arg(long)]
         kernel_version: String,
     },
+    /// List kernel versions available in the rootfs (paired kernel image + initrd)
+    ListKernels {
+        /// Path to the rootfs directory
+        #[arg(short, long)]
+        rootfs: PathBuf,
+    },
     /// Run a VM mounting an existing rootfs (distro is auto-detected from etc/os-release)
     Run {
         /// Path to the rootfs directory created by `create`
@@ -64,13 +70,9 @@ enum Commands {
         #[arg(long)]
         show_log: bool,
 
-        /// Custom kernel image; auto-detected from rootfs/boot/ when absent
+        /// Kernel version to boot (e.g. "6.1.0-47-amd64"). Auto-selected when exactly one is available.
         #[arg(long)]
-        kernel: Option<PathBuf>,
-
-        /// Custom initrd image; auto-detected from rootfs/boot/ when absent
-        #[arg(long)]
-        initrd: Option<PathBuf>,
+        kernel_version: Option<String>,
     },
 }
 
@@ -82,9 +84,30 @@ fn main() {
                 .map(|path| println!("initrd created: {}", path.display()))
         }
         Commands::Create { rootfs, distro } => qoc::create(distro.build().as_ref(), rootfs),
-        Commands::Run { rootfs, nr_network_cards, show_log, kernel, initrd } => {
-            qoc::detect_distro(&rootfs).and_then(|distro| {
-                let handle = qoc::start(distro.as_ref(), rootfs, nr_network_cards, show_log, kernel, initrd)?;
+        Commands::ListKernels { rootfs } => {
+            qoc::list_kernels(&rootfs).map(|kernels| {
+                for v in &kernels {
+                    println!("{v}");
+                }
+            })
+        }
+        Commands::Run { rootfs, nr_network_cards, show_log, kernel_version } => {
+            (|| -> anyhow::Result<()> {
+                let kver = match kernel_version {
+                    Some(v) => v,
+                    None => {
+                        let kernels = qoc::list_kernels(&rootfs)?;
+                        match kernels.as_slice() {
+                            [v] => v.clone(),
+                            [] => bail!("no kernels found in {}/boot", rootfs.display()),
+                            _ => bail!(
+                                "multiple kernels found; specify one with --kernel-version:\n  {}",
+                                kernels.join("\n  ")
+                            ),
+                        }
+                    }
+                };
+                let handle = qoc::start(rootfs, nr_network_cards, show_log, &kver)?;
                 let qemu_pid = handle.qemu_pid();
                 ctrlc::set_handler(move || {
                     unsafe { libc::kill(qemu_pid, libc::SIGTERM) };
@@ -92,7 +115,7 @@ fn main() {
                 .context("failed to set Ctrl-C handler")?;
                 handle.wait_for_info()?;
                 handle.wait()
-            })
+            })()
         }
     };
     if let Err(e) = result {
