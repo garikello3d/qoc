@@ -307,7 +307,7 @@ pub fn start(
             return;
         }
 
-        let kver_re = Regex::new(r"Linux version ([A-Za-z0-9._-]+) \(").unwrap();
+        let kver_re = Regex::new(r"Linux version ([A-Za-z0-9._+-]+) \(").unwrap();
         let kernel_version: Option<String> = proc_version
             .as_deref()
             .and_then(|s| kver_re.captures(s))
