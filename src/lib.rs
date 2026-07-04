@@ -37,6 +37,12 @@ const NIC_MODELS: &[&str] = &[
     "pcnet",
 ];
 
+fn qemu_smp_cpus() -> usize {
+    thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+}
+
 pub struct VmInfo {
     pub kernel_version: Option<String>,
     pub upstream_version: Option<String>,
@@ -219,10 +225,11 @@ pub fn start(
 
     thread::sleep(Duration::from_secs(1));
 
+    let smp_cpus = qemu_smp_cpus();
     let mut qemu_args: Vec<String> = vec![
         "-enable-kvm".into(),
         "-cpu".into(), "host".into(),
-        "-smp".into(), "2".into(),
+        "-smp".into(), smp_cpus.to_string(),
         "-m".into(), "2G".into(),
         "-object".into(), "memory-backend-memfd,id=mem,size=2G,share=on".into(),
         "-numa".into(), "node,memdev=mem".into(),
@@ -256,7 +263,9 @@ pub fn start(
         .stderr(log_stdio())
         .spawn()
         .context("failed to spawn qemu-system-x86_64")?;
-    println!("started qemu with {nr_network_cards} network card(s), chosen kernel {kernel_ver}");
+    println!(
+        "started qemu with {smp_cpus} CPU(s), {nr_network_cards} network card(s), chosen kernel {kernel_ver}"
+    );
 
     let qemu_pid = qemu.id() as libc::pid_t;
     let (info_tx, info_rx) = mpsc::channel::<Result<VmInfo>>();
@@ -573,5 +582,15 @@ fn find_boot_by_version(boot_dir: &Path, basenames: &[&str], ver: &str) -> Resul
         [path] => Ok(path.clone()),
         [] => bail!("no boot file with version {ver:?} found in {}", boot_dir.display()),
         _ => bail!("multiple boot files with version {ver:?} found in {}", boot_dir.display()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn qemu_smp_cpus_is_never_zero() {
+        assert!(qemu_smp_cpus() >= 1);
     }
 }
