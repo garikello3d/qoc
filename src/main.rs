@@ -1,9 +1,9 @@
 use std::path::PathBuf;
 use std::process;
 
-use anyhow::{bail, Context};
+use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
-use qoc::{Arch, Debian, Distro};
+use qoc::{Arch, Debian, DebianVersion, Distro};
 
 #[derive(Parser)]
 #[command(name = "qoc")]
@@ -20,10 +20,13 @@ enum DistroKind {
 }
 
 impl DistroKind {
-    fn build(self) -> Box<dyn Distro> {
-        match self {
-            DistroKind::Debian => Box::new(Debian),
-            DistroKind::Arch => Box::new(Arch),
+    fn build(self, debian_version: Option<DebianVersion>) -> Result<Box<dyn Distro>> {
+        match (self, debian_version) {
+            (DistroKind::Debian, version) => Ok(Box::new(Debian::new(version.unwrap_or_default()))),
+            (DistroKind::Arch, None) => Ok(Box::new(Arch)),
+            (DistroKind::Arch, Some(_)) => {
+                bail!("--debian-version can only be used with --distro debian")
+            }
         }
     }
 }
@@ -39,6 +42,10 @@ enum Commands {
         /// Which distribution to bootstrap
         #[arg(long, value_enum)]
         distro: DistroKind,
+
+        /// Debian release codename to bootstrap (bookworm, bullseye, trixie)
+        #[arg(long, value_name = "VERSION")]
+        debian_version: Option<DebianVersion>,
     },
     /// Regenerate an initrd image inside an existing rootfs
     MakeInitrd {
@@ -79,54 +86,89 @@ enum Commands {
 fn main() {
     let cli = Cli::parse();
     let result = match cli.command {
-        Commands::MakeInitrd { rootfs, kernel_version } => {
-            qoc::make_initrd(&rootfs, &kernel_version)
-                .map(|path| println!("initrd created: {}", path.display()))
-        }
-        Commands::Create { rootfs, distro } => {
-            qoc::create(distro.build().as_ref(), rootfs).map(|kernels| {
+        Commands::MakeInitrd {
+            rootfs,
+            kernel_version,
+        } => qoc::make_initrd(&rootfs, &kernel_version)
+            .map(|path| println!("initrd created: {}", path.display())),
+        Commands::Create {
+            rootfs,
+            distro,
+            debian_version,
+        } => (|| -> Result<()> {
+            let distro = distro.build(debian_version)?;
+            qoc::create(distro.as_ref(), rootfs).map(|kernels| {
                 for v in &kernels {
                     println!("kernel version available: {v}");
                 }
             })
-        }
-        Commands::ListKernels { rootfs } => {
-            qoc::list_kernels(&rootfs).map(|kernels| {
-                for v in &kernels {
-                    println!("{v}");
-                }
-            })
-        }
-        Commands::Run { rootfs, nr_network_cards, show_log, kernel_version } => {
-            (|| -> anyhow::Result<()> {
-                let kver = match kernel_version {
-                    Some(v) => v,
-                    None => {
-                        let kernels = qoc::list_kernels(&rootfs)?;
-                        match kernels.as_slice() {
-                            [v] => v.clone(),
-                            [] => bail!("no kernels found in {}/boot", rootfs.display()),
-                            _ => bail!(
-                                "multiple kernels found; specify one with --kernel-version:\n  {}",
-                                kernels.join("\n  ")
-                            ),
-                        }
+        })(),
+        Commands::ListKernels { rootfs } => qoc::list_kernels(&rootfs).map(|kernels| {
+            for v in &kernels {
+                println!("{v}");
+            }
+        }),
+        Commands::Run {
+            rootfs,
+            nr_network_cards,
+            show_log,
+            kernel_version,
+        } => (|| -> anyhow::Result<()> {
+            let kver = match kernel_version {
+                Some(v) => v,
+                None => {
+                    let kernels = qoc::list_kernels(&rootfs)?;
+                    match kernels.as_slice() {
+                        [v] => v.clone(),
+                        [] => bail!("no kernels found in {}/boot", rootfs.display()),
+                        _ => bail!(
+                            "multiple kernels found; specify one with --kernel-version:\n  {}",
+                            kernels.join("\n  ")
+                        ),
                     }
-                };
-                let (handle, kver) = qoc::start(rootfs, nr_network_cards, show_log, &kver)?;
-                println!("kernel version selected: {kver}");
-                let qemu_pid = handle.qemu_pid();
-                ctrlc::set_handler(move || {
-                    unsafe { libc::kill(qemu_pid, libc::SIGTERM) };
-                })
-                .context("failed to set Ctrl-C handler")?;
-                handle.wait_for_info()?;
-                handle.wait()
-            })()
-        }
+                }
+            };
+            let (handle, kver) = qoc::start(rootfs, nr_network_cards, show_log, &kver)?;
+            println!("kernel version selected: {kver}");
+            let qemu_pid = handle.qemu_pid();
+            ctrlc::set_handler(move || {
+                unsafe { libc::kill(qemu_pid, libc::SIGTERM) };
+            })
+            .context("failed to set Ctrl-C handler")?;
+            handle.wait_for_info()?;
+            handle.wait()
+        })(),
     };
     if let Err(e) = result {
         eprintln!("error: {e:#}");
         process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn debian_distro_build_accepts_debian_version() {
+        let distro = DistroKind::Debian
+            .build(Some(DebianVersion::Trixie))
+            .unwrap();
+        assert_eq!(distro.name(), "debian");
+    }
+
+    #[test]
+    fn debian_distro_build_defaults_to_bookworm() {
+        let distro = DistroKind::Debian.build(None).unwrap();
+        assert_eq!(distro.name(), "debian");
+    }
+
+    #[test]
+    fn arch_distro_build_rejects_debian_version() {
+        let err = match DistroKind::Arch.build(Some(DebianVersion::Bullseye)) {
+            Ok(_) => panic!("arch accepted --debian-version"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("--debian-version"));
     }
 }

@@ -14,7 +14,7 @@ use anyhow::{bail, Context, Result};
 use regex::Regex;
 
 mod distro;
-pub use distro::{Arch, Debian, Distro};
+pub use distro::{Arch, Debian, DebianVersion, Distro};
 
 const KERNEL_BASENAMES: &[&str] = &["vmlinuz", "bzImage", "kernel", "linux"];
 const INITRD_BASENAMES: &[&str] = &["initramfs", "initrd"];
@@ -88,8 +88,7 @@ impl VmHandle {
     /// Run an arbitrary command on the guest and return its output.
     /// Call [`VmHandle::wait_for_info`] first to ensure the VM is up.
     pub fn ssh(&self, remote_args: &[&str]) -> Result<SshOutput> {
-        let out = ssh_exec(self.ssh_port, remote_args)
-            .context("failed to spawn ssh")?;
+        let out = ssh_exec(self.ssh_port, remote_args).context("failed to spawn ssh")?;
         Ok(SshOutput {
             stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
@@ -151,8 +150,12 @@ pub fn list_kernels(rootfs: &Path) -> Result<Vec<String>> {
         .filter_map(|e| e.ok())
     {
         let path = entry.path();
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
-        let Some((basename, version)) = split_boot_filename(name) else { continue };
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let Some((basename, version)) = split_boot_filename(name) else {
+            continue;
+        };
         if contains_any(basename, KERNEL_BASENAMES) {
             *kernel_counts.entry(version.to_string()).or_insert(0) += 1;
         } else if contains_any(basename, INITRD_BASENAMES) {
@@ -199,11 +202,19 @@ pub fn start(
     let rootfs_str = rootfs.to_str().context("rootfs path is not valid UTF-8")?;
     let boot_dir = rootfs.join("boot");
     let vmlinuz = find_boot_by_version(&boot_dir, KERNEL_BASENAMES, kernel_ver)?;
-    let initrd  = find_boot_by_version(&boot_dir, INITRD_BASENAMES, kernel_ver)?;
-    let vmlinuz_str = vmlinuz.to_str().context("vmlinuz path is not valid UTF-8")?;
+    let initrd = find_boot_by_version(&boot_dir, INITRD_BASENAMES, kernel_ver)?;
+    let vmlinuz_str = vmlinuz
+        .to_str()
+        .context("vmlinuz path is not valid UTF-8")?;
     let initrd_str = initrd.to_str().context("initrd path is not valid UTF-8")?;
 
-    let log_stdio = || if show_log { Stdio::inherit() } else { Stdio::null() };
+    let log_stdio = || {
+        if show_log {
+            Stdio::inherit()
+        } else {
+            Stdio::null()
+        }
+    };
 
     let ssh_port = find_free_port().context("failed to find a free SSH host port")?;
     let socket_path = format!("/tmp/vhost-fs-{}.sock", process::id());
@@ -228,16 +239,26 @@ pub fn start(
     let smp_cpus = qemu_smp_cpus();
     let mut qemu_args: Vec<String> = vec![
         "-enable-kvm".into(),
-        "-cpu".into(), "host".into(),
-        "-smp".into(), smp_cpus.to_string(),
-        "-m".into(), "4G".into(),
-        "-object".into(), "memory-backend-memfd,id=mem,size=4G,share=on".into(),
-        "-numa".into(), "node,memdev=mem".into(),
-        "-chardev".into(), format!("socket,id=char0,path={socket_path}"),
-        "-device".into(), "vhost-user-fs-pci,queue-size=1024,chardev=char0,tag=rootfs".into(),
-        "-kernel".into(), vmlinuz_str.into(),
-        "-initrd".into(), initrd_str.into(),
-        "-append".into(), "root=rootfs rootfstype=virtiofs rw console=ttyS0".into(),
+        "-cpu".into(),
+        "host".into(),
+        "-smp".into(),
+        smp_cpus.to_string(),
+        "-m".into(),
+        "4G".into(),
+        "-object".into(),
+        "memory-backend-memfd,id=mem,size=4G,share=on".into(),
+        "-numa".into(),
+        "node,memdev=mem".into(),
+        "-chardev".into(),
+        format!("socket,id=char0,path={socket_path}"),
+        "-device".into(),
+        "vhost-user-fs-pci,queue-size=1024,chardev=char0,tag=rootfs".into(),
+        "-kernel".into(),
+        vmlinuz_str.into(),
+        "-initrd".into(),
+        initrd_str.into(),
+        "-append".into(),
+        "root=rootfs rootfstype=virtiofs rw console=ttyS0".into(),
         "-nographic".into(),
     ];
 
@@ -251,8 +272,10 @@ pub fn start(
             format!("user,id={net_id},net={subnet}")
         };
         qemu_args.extend([
-            "-netdev".into(), netdev,
-            "-device".into(), format!("{},netdev={net_id},mac={mac}", NIC_MODELS[i]),
+            "-netdev".into(),
+            netdev,
+            "-device".into(),
+            format!("{},netdev={net_id},mac={mac}", NIC_MODELS[i]),
         ]);
     }
 
@@ -331,7 +354,8 @@ pub fn start(
             .and_then(|s| debian_re.captures(s))
             .map(|c| c[1].to_string())
             .or_else(|| {
-                kernel_version.as_deref()
+                kernel_version
+                    .as_deref()
                     .and_then(|v| numeric_re.captures(v))
                     .map(|c| c[1].to_string())
             });
@@ -341,20 +365,39 @@ pub fn start(
         println!("VM is up — connect with: ssh -p {ssh_port} root@localhost");
         match (kernel_version.as_deref(), upstream_version.as_deref()) {
             (Some(kv), Some(uv)) => println!("active kernel version: {kv}  (upstream: {uv})"),
-            (Some(kv), None)     => println!("active kernel version: {kv}"),
-            _                    => println!("active kernel version: unknown"),
+            (Some(kv), None) => println!("active kernel version: {kv}"),
+            _ => println!("active kernel version: unknown"),
         }
-        println!("kernel config: {}", if kernel_config.is_some() { "extracted" } else { "not available" });
+        println!(
+            "kernel config: {}",
+            if kernel_config.is_some() {
+                "extracted"
+            } else {
+                "not available"
+            }
+        );
 
         // Deliver VmInfo to the caller; channel is done after this send.
-        let _ = info_tx.send(Ok(VmInfo { kernel_version, upstream_version, kernel_config }));
+        let _ = info_tx.send(Ok(VmInfo {
+            kernel_version,
+            upstream_version,
+            kernel_config,
+        }));
 
         // Keep running until QEMU exits (guest shutdown or external signal).
         let _ = qemu.wait();
         let _ = virtiofsd_child.wait();
     });
 
-    Ok((VmHandle { ssh_port, qemu_pid, info_rx, thread: Some(thread) }, kernel_ver.to_string()))
+    Ok((
+        VmHandle {
+            ssh_port,
+            qemu_pid,
+            info_rx,
+            thread: Some(thread),
+        },
+        kernel_ver.to_string(),
+    ))
 }
 
 pub fn detect_distro(rootfs: &Path) -> Result<Box<dyn Distro>> {
@@ -382,7 +425,11 @@ pub fn detect_distro(rootfs: &Path) -> Result<Box<dyn Distro>> {
     match id.as_str() {
         "debian" => Ok(Box::new(Debian)),
         "arch" => Ok(Box::new(Arch)),
-        other => bail!("unrecognised distro ID {:?} in {}", other, os_release.display()),
+        other => bail!(
+            "unrecognised distro ID {:?} in {}",
+            other,
+            os_release.display()
+        ),
     }
 }
 
@@ -449,9 +496,7 @@ pub fn make_initrd(rootfs: &Path, kernel_version: &str) -> Result<PathBuf> {
     match distro.name() {
         "arch" => {
             let out = format!("/boot/initramfs-{kernel_version}.img");
-            let script = format!(
-                "mkinitcpio -k {kernel_version} -c /etc/mkinitcpio.conf -g {out}"
-            );
+            let script = format!("mkinitcpio -k {kernel_version} -c /etc/mkinitcpio.conf -g {out}");
             run_proot(rootfs, distro.proot_binds(), &script)?;
             Ok(PathBuf::from(out))
         }
@@ -470,9 +515,12 @@ pub fn make_initrd(rootfs: &Path, kernel_version: &str) -> Result<PathBuf> {
 fn ssh_exec(port: u16, remote_args: &[&str]) -> std::io::Result<std::process::Output> {
     let port_str = port.to_string();
     let mut args = vec![
-        "-p", &port_str,
-        "-o", "StrictHostKeyChecking=no",
-        "-o", "UserKnownHostsFile=/dev/null",
+        "-p",
+        &port_str,
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "UserKnownHostsFile=/dev/null",
         "root@localhost",
     ];
     args.extend_from_slice(remote_args);
@@ -499,7 +547,11 @@ fn fetch_kernel_config(port: u16, kver: Option<&str>) -> Option<String> {
         return None;
     }
     let listing = String::from_utf8_lossy(&ls_out.stdout);
-    let path = listing.lines().find(|l| l.contains(kver))?.trim().to_string();
+    let path = listing
+        .lines()
+        .find(|l| l.contains(kver))?
+        .trim()
+        .to_string();
     let cat = ssh_exec(port, &["cat", &path]).ok()?;
     if cat.status.success() {
         Some(String::from_utf8_lossy(&cat.stdout).into_owned())
@@ -510,7 +562,10 @@ fn fetch_kernel_config(port: u16, kver: Option<&str>) -> Option<String> {
 
 fn find_free_port() -> Result<u16> {
     let listener = TcpListener::bind("127.0.0.1:0").context("failed to bind TCP listener")?;
-    Ok(listener.local_addr().context("failed to get local address")?.port())
+    Ok(listener
+        .local_addr()
+        .context("failed to get local address")?
+        .port())
 }
 
 fn binary_in_path(name: &str) -> bool {
@@ -555,8 +610,15 @@ fn split_boot_filename(name: &str) -> Option<(&str, &str)> {
     let dash = name.find('-')?;
     let basename = &name[..dash];
     let raw = &name[dash + 1..];
-    let version = IMAGE_EXTENSIONS.iter().find_map(|ext| raw.strip_suffix(ext)).unwrap_or(raw);
-    if version.is_empty() { None } else { Some((basename, version)) }
+    let version = IMAGE_EXTENSIONS
+        .iter()
+        .find_map(|ext| raw.strip_suffix(ext))
+        .unwrap_or(raw);
+    if version.is_empty() {
+        None
+    } else {
+        Some((basename, version))
+    }
 }
 
 fn contains_any(s: &str, keywords: &[&str]) -> bool {
@@ -580,8 +642,14 @@ fn find_boot_by_version(boot_dir: &Path, basenames: &[&str], ver: &str) -> Resul
         .collect();
     match matches.as_slice() {
         [path] => Ok(path.clone()),
-        [] => bail!("no boot file with version {ver:?} found in {}", boot_dir.display()),
-        _ => bail!("multiple boot files with version {ver:?} found in {}", boot_dir.display()),
+        [] => bail!(
+            "no boot file with version {ver:?} found in {}",
+            boot_dir.display()
+        ),
+        _ => bail!(
+            "multiple boot files with version {ver:?} found in {}",
+            boot_dir.display()
+        ),
     }
 }
 

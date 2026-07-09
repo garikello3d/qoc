@@ -12,7 +12,7 @@ Your `~/.ssh/id_*.pub` key is injected during create, so passwordless SSH works 
 
 | `--distro` | Base | Notes |
 |---|---|---|
-| `debian` | Bookworm (amd64) | two-stage `debootstrap` |
+| `debian` | Bookworm (amd64) by default | two-stage `debootstrap`; `--debian-version` supports `bookworm`, `bullseye`, `trixie` |
 | `arch` | latest rolling | bootstrap tarball + `pacman` |
 
 ## Dependencies
@@ -40,6 +40,9 @@ cargo build --release
 # 1. Create the rootfs (takes a few minutes)
 qoc create --rootfs ~/vms/debian-test --distro debian
 
+# Or choose a supported Debian release explicitly
+qoc create --rootfs ~/vms/debian-trixie --distro debian --debian-version trixie
+
 # 2. Boot it (distro is auto-detected)
 qoc run --rootfs ~/vms/debian-test
 
@@ -66,8 +69,9 @@ Each NIC gets its own `/24` subnet starting at `10.0.2.0/24`; the first card als
 
 ```
 qoc create
-  -r, --rootfs <PATH>     destination directory (must not exist)
-      --distro <DISTRO>   debian | arch
+  -r, --rootfs <PATH>              destination directory (must not exist)
+      --distro <DISTRO>            debian | arch
+      --debian-version <VERSION>   bookworm | bullseye | trixie (debian only; default: bookworm)
 
 qoc run
   -r, --rootfs <PATH>     directory created by 'create'

@@ -1,6 +1,8 @@
+use std::fmt;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
+use std::str::FromStr;
 
 use anyhow::{bail, Context, Result};
 
@@ -70,8 +72,81 @@ systemctl enable systemd-resolved"
     )
 }
 
-/// Debian bookworm via two-stage debootstrap + initramfs-tools.
-pub struct Debian;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DebianVersion {
+    Bookworm,
+    Bullseye,
+    Trixie,
+}
+
+impl DebianVersion {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            DebianVersion::Bookworm => "bookworm",
+            DebianVersion::Bullseye => "bullseye",
+            DebianVersion::Trixie => "trixie",
+        }
+    }
+
+    const fn components(self) -> &'static str {
+        match self {
+            DebianVersion::Bullseye => "main,contrib,non-free",
+            DebianVersion::Bookworm | DebianVersion::Trixie => "main,contrib,non-free-firmware",
+        }
+    }
+}
+
+impl Default for DebianVersion {
+    fn default() -> Self {
+        DebianVersion::Bookworm
+    }
+}
+
+impl fmt::Display for DebianVersion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for DebianVersion {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "bookworm" => Ok(DebianVersion::Bookworm),
+            "bullseye" => Ok(DebianVersion::Bullseye),
+            "trixie" => Ok(DebianVersion::Trixie),
+            other => Err(format!(
+                "invalid Debian version {other:?}; expected one of: bookworm, bullseye, trixie"
+            )),
+        }
+    }
+}
+
+/// Debian via two-stage debootstrap + initramfs-tools.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Debian {
+    version: DebianVersion,
+}
+
+#[allow(non_upper_case_globals)]
+pub const Debian: Debian = Debian::new(DebianVersion::Bookworm);
+
+impl Debian {
+    pub const fn new(version: DebianVersion) -> Self {
+        Self { version }
+    }
+
+    pub const fn version(self) -> DebianVersion {
+        self.version
+    }
+}
+
+impl Default for Debian {
+    fn default() -> Self {
+        Self::new(DebianVersion::default())
+    }
+}
 
 impl Distro for Debian {
     fn name(&self) -> &str {
@@ -96,14 +171,15 @@ impl Distro for Debian {
 
     fn bootstrap(&self, rootfs: &Path) -> Result<()> {
         let rootfs_str = rootfs.to_str().context("rootfs path is not valid UTF-8")?;
+        let components = format!("--components={}", self.version.components());
         let status = Command::new("fakeroot")
             .args([
                 "debootstrap",
                 "--foreign",
                 "--include=linux-image-amd64,initramfs-tools,openssh-server,systemd-sysv,systemd-resolved,dbus,locales,ethtool,firmware-linux-nonfree,firmware-misc-nonfree",
-                "--components=main,contrib,non-free-firmware",
+                &components,
                 "--arch=amd64",
-                "bookworm",
+                self.version.as_str(),
                 rootfs_str,
                 "http://deb.debian.org/debian",
             ])
@@ -123,6 +199,71 @@ update-initramfs -c -u -k all
 echo 'en_GB.UTF-8 UTF-8' >> /etc/locale.gen
 locale-gen"#
             .to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn debian_version_defaults_to_bookworm() {
+        assert_eq!(DebianVersion::default(), DebianVersion::Bookworm);
+        assert_eq!(Debian::default().version(), DebianVersion::Bookworm);
+        assert_eq!(Debian.version(), DebianVersion::Bookworm);
+    }
+
+    #[test]
+    fn debian_version_parses_supported_codenames() {
+        assert_eq!(
+            "bookworm".parse::<DebianVersion>().unwrap(),
+            DebianVersion::Bookworm
+        );
+        assert_eq!(
+            "bullseye".parse::<DebianVersion>().unwrap(),
+            DebianVersion::Bullseye
+        );
+        assert_eq!(
+            "trixie".parse::<DebianVersion>().unwrap(),
+            DebianVersion::Trixie
+        );
+    }
+
+    #[test]
+    fn debian_version_displays_as_codename() {
+        assert_eq!(DebianVersion::Bookworm.to_string(), "bookworm");
+        assert_eq!(DebianVersion::Bullseye.to_string(), "bullseye");
+        assert_eq!(DebianVersion::Trixie.to_string(), "trixie");
+    }
+
+    #[test]
+    fn debian_version_rejects_unknown_codename() {
+        assert!("stretch".parse::<DebianVersion>().is_err());
+    }
+
+    #[test]
+    fn debian_proot_binds_are_empty_for_all_versions() {
+        assert_eq!(
+            Debian::new(DebianVersion::Bookworm).proot_binds(),
+            &[] as &[&str]
+        );
+        assert_eq!(
+            Debian::new(DebianVersion::Bullseye).proot_binds(),
+            &[] as &[&str]
+        );
+        assert_eq!(
+            Debian::new(DebianVersion::Trixie).proot_binds(),
+            &[] as &[&str]
+        );
+    }
+
+    #[test]
+    fn debian_script_has_no_proc_mount_check_or_awk_dependency() {
+        let script = Debian::new(DebianVersion::Trixie).install_and_kernel_script();
+        assert!(script.starts_with("/debootstrap/debootstrap --second-stage"));
+        assert!(!script.contains("mountinfo"));
+        assert!(!script.contains("requires /proc mounted inside proot"));
+        assert!(!script.contains("awk"));
     }
 }
 
@@ -177,7 +318,14 @@ impl Distro for Arch {
             .with_context(|| format!("failed to create {}", rootfs.display()))?;
 
         let status = Command::new("bsdtar")
-            .args(["-x", "--strip-components=1", "-f", tarball, "-C", rootfs_str])
+            .args([
+                "-x",
+                "--strip-components=1",
+                "-f",
+                tarball,
+                "-C",
+                rootfs_str,
+            ])
             .status()
             .context("failed to spawn bsdtar")?;
         if !status.success() {
