@@ -6,6 +6,18 @@ use std::str::FromStr;
 
 use anyhow::{bail, Context, Result};
 
+const DEBIAN_COMMON_BOOTSTRAP_PACKAGES: &[&str] = &[
+    "linux-image-amd64",
+    "initramfs-tools",
+    "openssh-server",
+    "systemd-sysv",
+    "dbus",
+    "locales",
+    "ethtool",
+    "firmware-linux-nonfree",
+    "firmware-misc-nonfree",
+];
+
 /// Hostname set inside every guest, regardless of distro.
 pub const HOSTNAME: &str = "qoc-vm";
 
@@ -94,6 +106,21 @@ impl DebianVersion {
             DebianVersion::Bookworm | DebianVersion::Trixie => "main,contrib,non-free-firmware",
         }
     }
+
+    const fn version_bootstrap_packages(self) -> &'static [&'static str] {
+        match self {
+            DebianVersion::Bullseye => &["systemd"],
+            DebianVersion::Bookworm | DebianVersion::Trixie => &["systemd-resolved"],
+        }
+    }
+
+    fn bootstrap_packages(self) -> Vec<&'static str> {
+        DEBIAN_COMMON_BOOTSTRAP_PACKAGES
+            .iter()
+            .copied()
+            .chain(self.version_bootstrap_packages().iter().copied())
+            .collect()
+    }
 }
 
 impl Default for DebianVersion {
@@ -172,11 +199,12 @@ impl Distro for Debian {
     fn bootstrap(&self, rootfs: &Path) -> Result<()> {
         let rootfs_str = rootfs.to_str().context("rootfs path is not valid UTF-8")?;
         let components = format!("--components={}", self.version.components());
+        let include = format!("--include={}", self.version.bootstrap_packages().join(","));
         let status = Command::new("fakeroot")
             .args([
                 "debootstrap",
                 "--foreign",
-                "--include=linux-image-amd64,initramfs-tools,openssh-server,systemd-sysv,systemd-resolved,dbus,locales,ethtool,firmware-linux-nonfree,firmware-misc-nonfree",
+                &include,
                 &components,
                 "--arch=amd64",
                 self.version.as_str(),
@@ -264,6 +292,25 @@ mod tests {
         assert!(!script.contains("mountinfo"));
         assert!(!script.contains("requires /proc mounted inside proot"));
         assert!(!script.contains("awk"));
+    }
+
+    #[test]
+    fn debian_bootstrap_packages_vary_by_version() {
+        assert!(DEBIAN_COMMON_BOOTSTRAP_PACKAGES.contains(&"systemd-sysv"));
+        assert!(!DEBIAN_COMMON_BOOTSTRAP_PACKAGES.contains(&"systemd"));
+        assert!(!DEBIAN_COMMON_BOOTSTRAP_PACKAGES.contains(&"systemd-resolved"));
+
+        let bullseye = DebianVersion::Bullseye.bootstrap_packages();
+        assert!(bullseye.contains(&"systemd"));
+        assert!(!bullseye.contains(&"systemd-resolved"));
+
+        let bookworm = DebianVersion::Bookworm.bootstrap_packages();
+        assert!(bookworm.contains(&"systemd-resolved"));
+        assert!(!bookworm.contains(&"systemd"));
+
+        let trixie = DebianVersion::Trixie.bootstrap_packages();
+        assert!(trixie.contains(&"systemd-resolved"));
+        assert!(!trixie.contains(&"systemd"));
     }
 }
 
