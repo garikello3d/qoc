@@ -14,7 +14,7 @@ use anyhow::{bail, Context, Result};
 use regex::Regex;
 
 mod distro;
-pub use distro::{Arch, Debian, DebianVersion, Distro};
+pub use distro::{Alpine, Arch, Debian, DebianVersion, Distro};
 
 const KERNEL_BASENAMES: &[&str] = &["vmlinuz", "bzImage", "kernel", "linux"];
 const INITRD_BASENAMES: &[&str] = &["initramfs", "initrd"];
@@ -132,7 +132,7 @@ pub fn create(distro: &dyn Distro, rootfs: PathBuf) -> Result<Vec<String>> {
 
     distro.bootstrap(&rootfs)?;
 
-    run_proot(&rootfs, distro.proot_binds(), &distro.configure_script())?;
+    run_proot(&rootfs, distro, &distro.configure_script())?;
 
     install_ssh_key(&rootfs).context("failed to install SSH public key")?;
 
@@ -422,7 +422,12 @@ pub fn detect_distro(rootfs: &Path) -> Result<Box<dyn Distro>> {
         .next()
         .with_context(|| format!("no ID field found in {}", os_release.display()))?;
 
-    match id.as_str() {
+    distro_from_id(&id, &os_release)
+}
+
+fn distro_from_id(id: &str, os_release: &Path) -> Result<Box<dyn Distro>> {
+    match id {
+        "alpine" => Ok(Box::new(Alpine)),
         "debian" => Ok(Box::new(Debian)),
         "arch" => Ok(Box::new(Arch)),
         other => bail!(
@@ -437,16 +442,16 @@ pub fn detect_distro(rootfs: &Path) -> Result<Box<dyn Distro>> {
 // makes the script fail fast (`set -e`) and fixes PATH. `binds` are passed as
 // `-b <path>`; they are per-distro because Debian's debootstrap second stage
 // aborts proot (compare_paths2 assertion) when /dev,/proc,/sys are bound.
-fn run_proot(rootfs: &Path, binds: &[&str], script: &str) -> Result<()> {
+fn run_proot(rootfs: &Path, distro: &dyn Distro, script: &str) -> Result<()> {
     let rootfs_str = rootfs.to_str().context("rootfs path is not valid UTF-8")?;
     let full = format!("set -e\nexport PATH=/usr/bin:/usr/sbin:/bin:/sbin\n{script}");
 
     let mut args: Vec<&str> = Vec::new();
-    for bind in binds {
+    for bind in distro.proot_binds() {
         args.push("-b");
         args.push(bind);
     }
-    args.extend(["-0", "-r", rootfs_str, "/bin/bash", "-c", &full]);
+    args.extend(["-0", "-r", rootfs_str, distro.proot_shell(), "-c", &full]);
 
     let status = Command::new("proot")
         .args(&args)
@@ -461,16 +466,16 @@ fn run_proot(rootfs: &Path, binds: &[&str], script: &str) -> Result<()> {
 
 // Like run_proot but captures stdout+stderr instead of inheriting them.
 // Returns combined output so callers can search both streams with a single regex.
-fn run_proot_capture(rootfs: &Path, binds: &[&str], script: &str) -> Result<String> {
+fn run_proot_capture(rootfs: &Path, distro: &dyn Distro, script: &str) -> Result<String> {
     let rootfs_str = rootfs.to_str().context("rootfs path is not valid UTF-8")?;
     let full = format!("set -e\nexport PATH=/usr/bin:/usr/sbin:/bin:/sbin\n{script}");
 
     let mut args: Vec<&str> = Vec::new();
-    for bind in binds {
+    for bind in distro.proot_binds() {
         args.push("-b");
         args.push(bind);
     }
-    args.extend(["-0", "-r", rootfs_str, "/bin/bash", "-c", &full]);
+    args.extend(["-0", "-r", rootfs_str, distro.proot_shell(), "-c", &full]);
 
     let out = Command::new("proot")
         .args(&args)
@@ -494,15 +499,25 @@ pub fn make_initrd(rootfs: &Path, kernel_version: &str) -> Result<PathBuf> {
     let distro = detect_distro(rootfs)?;
 
     match distro.name() {
+        "alpine" => {
+            let out = alpine_initramfs_path(kernel_version)?;
+            let out_str = out
+                .to_str()
+                .context("Alpine initramfs path is not valid UTF-8")?;
+            let script =
+                format!("mkinitfs -c /etc/mkinitfs/mkinitfs.conf -o {out_str} {kernel_version}");
+            run_proot(rootfs, distro.as_ref(), &script)?;
+            Ok(out)
+        }
         "arch" => {
             let out = format!("/boot/initramfs-{kernel_version}.img");
             let script = format!("mkinitcpio -k {kernel_version} -c /etc/mkinitcpio.conf -g {out}");
-            run_proot(rootfs, distro.proot_binds(), &script)?;
+            run_proot(rootfs, distro.as_ref(), &script)?;
             Ok(PathBuf::from(out))
         }
         "debian" => {
             let script = format!("update-initramfs -c -u -k {kernel_version}");
-            let captured = run_proot_capture(rootfs, distro.proot_binds(), &script)?;
+            let captured = run_proot_capture(rootfs, distro.as_ref(), &script)?;
             let re = Regex::new(r"update-initramfs: Generating (/boot/\S+)").unwrap();
             re.captures(&captured)
                 .map(|c| PathBuf::from(&c[1]))
@@ -510,6 +525,15 @@ pub fn make_initrd(rootfs: &Path, kernel_version: &str) -> Result<PathBuf> {
         }
         other => bail!("make_initrd: unsupported distro '{other}'"),
     }
+}
+
+fn alpine_initramfs_path(kernel_version: &str) -> Result<PathBuf> {
+    let flavor = kernel_version
+        .rsplit('-')
+        .next()
+        .filter(|flavor| !flavor.is_empty() && *flavor != kernel_version)
+        .context("Alpine kernel version has no kernel flavor")?;
+    Ok(PathBuf::from(format!("/boot/initramfs-{flavor}")))
 }
 
 fn ssh_exec(port: u16, remote_args: &[&str]) -> std::io::Result<std::process::Output> {
@@ -660,5 +684,30 @@ mod tests {
     #[test]
     fn qemu_smp_cpus_is_never_zero() {
         assert!(qemu_smp_cpus() >= 1);
+    }
+
+    #[test]
+    fn alpine_distro_id_is_recognised() {
+        let distro = distro_from_id("alpine", Path::new("/rootfs/etc/os-release")).unwrap();
+        assert_eq!(distro.name(), "alpine");
+        assert_eq!(distro.proot_shell(), "/bin/sh");
+    }
+
+    #[test]
+    fn alpine_boot_files_have_matching_lts_flavor() {
+        assert_eq!(split_boot_filename("vmlinuz-lts"), Some(("vmlinuz", "lts")));
+        assert_eq!(
+            split_boot_filename("initramfs-lts"),
+            Some(("initramfs", "lts"))
+        );
+    }
+
+    #[test]
+    fn alpine_initramfs_path_uses_kernel_flavor() {
+        assert_eq!(
+            alpine_initramfs_path("6.12.40-0-lts").unwrap(),
+            PathBuf::from("/boot/initramfs-lts")
+        );
+        assert!(alpine_initramfs_path("6.12.40").is_err());
     }
 }

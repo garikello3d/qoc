@@ -3,7 +3,7 @@ use std::process;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
-use qoc::{Arch, Debian, DebianVersion, Distro};
+use qoc::{Alpine, Arch, Debian, DebianVersion, Distro};
 
 #[derive(Parser)]
 #[command(name = "qoc")]
@@ -17,6 +17,7 @@ struct Cli {
 enum DistroKind {
     Debian,
     Arch,
+    Alpine,
 }
 
 impl DistroKind {
@@ -24,7 +25,11 @@ impl DistroKind {
         match (self, debian_version) {
             (DistroKind::Debian, version) => Ok(Box::new(Debian::new(version.unwrap_or_default()))),
             (DistroKind::Arch, None) => Ok(Box::new(Arch)),
+            (DistroKind::Alpine, None) => Ok(Box::new(Alpine)),
             (DistroKind::Arch, Some(_)) => {
+                bail!("--debian-version can only be used with --distro debian")
+            }
+            (DistroKind::Alpine, Some(_)) => {
                 bail!("--debian-version can only be used with --distro debian")
             }
         }
@@ -167,6 +172,21 @@ mod tests {
     fn arch_distro_build_rejects_debian_version() {
         let err = match DistroKind::Arch.build(Some(DebianVersion::Bullseye)) {
             Ok(_) => panic!("arch accepted --debian-version"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("--debian-version"));
+    }
+
+    #[test]
+    fn alpine_distro_builds_without_version_option() {
+        let distro = DistroKind::Alpine.build(None).unwrap();
+        assert_eq!(distro.name(), "alpine");
+    }
+
+    #[test]
+    fn alpine_distro_build_rejects_debian_version() {
+        let err = match DistroKind::Alpine.build(Some(DebianVersion::Bullseye)) {
+            Ok(_) => panic!("alpine accepted --debian-version"),
             Err(err) => err,
         };
         assert!(err.to_string().contains("--debian-version"));

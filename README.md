@@ -1,10 +1,10 @@
 # qoc
 
-Spinning up a VM usually means fighting `sudo`, editing `/etc/sudoers`, or convincing your admin to whitelist `qemu-system-*` — just to boot something you'll throw away in an hour. `qoc` skips all of that: create and run a full Debian or Arch VM as a plain user, no elevated privileges required.
+Spinning up a VM usually means fighting `sudo`, editing `/etc/sudoers`, or convincing your admin to whitelist `qemu-system-*` — just to boot something you'll throw away in an hour. `qoc` skips all of that: create and run a full Debian, Arch, or Alpine VM as a plain user, no elevated privileges required.
 
 Inspired by [virtme-ng](https://github.com/arighi/virtme-ng).
 
-`qoc create` builds a rootfs on the host using `proot` + `debootstrap` / `pacstrap`. `qoc run` boots it inside QEMU (KVM) with the rootfs exposed via virtiofs, waits for SSH, and leaves you with a live shell target. The SSH host port is picked automatically so multiple VMs can run side by side.
+`qoc create` builds a rootfs on the host using `proot` plus a distro bootstrap tool or rootfs tarball. `qoc run` boots it inside QEMU (KVM) with the rootfs exposed via virtiofs, waits for SSH, and leaves you with a live shell target. The SSH host port is picked automatically so multiple VMs can run side by side.
 
 Your `~/.ssh/id_*.pub` key is injected during create, so passwordless SSH works the moment the VM is up.
 
@@ -14,6 +14,7 @@ Your `~/.ssh/id_*.pub` key is injected during create, so passwordless SSH works 
 |---|---|---|
 | `debian` | Bookworm (amd64) by default | two-stage `debootstrap`; `--debian-version` supports `bookworm`, `bullseye`, `trixie` |
 | `arch` | latest rolling | bootstrap tarball + `pacman` |
+| `alpine` | 3.22.1 (x86_64) | pinned minirootfs + `apk`; `linux-lts` follows the v3.22 repositories; firmware omitted for emulated hardware |
 
 ## Dependencies
 
@@ -21,7 +22,7 @@ Your `~/.ssh/id_*.pub` key is injected during create, so passwordless SSH works 
 |---|---|
 | `proot` | rootfs configuration without root |
 | `fakeroot` + `debootstrap` | Debian create |
-| `curl` + `bsdtar` | Arch create |
+| `curl` + `bsdtar` | Arch or Alpine create |
 | `virtiofsd` | run (any distro) |
 | `qemu-system-x86_64` | run (any distro) |
 
@@ -63,6 +64,20 @@ qoc run --rootfs ~/vms/arch-net --nr-network-cards 4
 ssh -p <port> -o StrictHostKeyChecking=no root@localhost ip -br a
 ```
 
+### Alpine Linux VM
+
+```sh
+# 1. Create the pinned Alpine 3.22.1 rootfs
+qoc create --rootfs ~/vms/alpine-test --distro alpine
+
+# 2. Boot it (the paired boot-file selector is "lts")
+qoc run --rootfs ~/vms/alpine-test
+
+# Inspect the Alpine release and installed v3.22 linux-lts kernel
+ssh -p <port> -o StrictHostKeyChecking=no root@localhost \
+  'cat /etc/alpine-release; uname -r'
+```
+
 Each NIC gets its own `/24` subnet starting at `10.0.2.0/24`; the first card also carries the SSH forward to `guest:22` on an automatically chosen host port.
 
 ## Options
@@ -70,7 +85,7 @@ Each NIC gets its own `/24` subnet starting at `10.0.2.0/24`; the first card als
 ```
 qoc create
   -r, --rootfs <PATH>              destination directory (must not exist)
-      --distro <DISTRO>            debian | arch
+      --distro <DISTRO>            debian | arch | alpine
       --debian-version <VERSION>   bookworm | bullseye | trixie (debian only; default: bookworm)
 
 qoc run
