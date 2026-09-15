@@ -70,13 +70,17 @@ ssh -p <port> -o StrictHostKeyChecking=no root@localhost ip -br a
 # 1. Create the pinned Alpine 3.22.1 rootfs
 qoc create --rootfs ~/vms/alpine-test --distro alpine
 
-# 2. Boot it (the paired boot-file selector is "lts")
+# 2. Boot it (qoc uses the full kernel release printed during creation)
 qoc run --rootfs ~/vms/alpine-test
 
 # Inspect the Alpine release and installed v3.22 linux-lts kernel
 ssh -p <port> -o StrictHostKeyChecking=no root@localhost \
   'cat /etc/alpine-release; uname -r'
 ```
+
+Kernel images and initrds are named with the full kernel release on every
+supported distro. The same value printed by `create` is accepted by
+`run --kernel-version` and printed by `list-kernels`.
 
 Each NIC gets its own `/24` subnet starting at `10.0.2.0/24`; the first card also carries the SSH forward to `guest:22` on an automatically chosen host port.
 

@@ -528,12 +528,10 @@ pub fn make_initrd(rootfs: &Path, kernel_version: &str) -> Result<PathBuf> {
 }
 
 fn alpine_initramfs_path(kernel_version: &str) -> Result<PathBuf> {
-    let flavor = kernel_version
-        .rsplit('-')
-        .next()
-        .filter(|flavor| !flavor.is_empty() && *flavor != kernel_version)
-        .context("Alpine kernel version has no kernel flavor")?;
-    Ok(PathBuf::from(format!("/boot/initramfs-{flavor}")))
+    if kernel_version.is_empty() {
+        bail!("Alpine kernel version is empty");
+    }
+    Ok(PathBuf::from(format!("/boot/initramfs-{kernel_version}")))
 }
 
 fn ssh_exec(port: u16, remote_args: &[&str]) -> std::io::Result<std::process::Output> {
@@ -694,20 +692,55 @@ mod tests {
     }
 
     #[test]
-    fn alpine_boot_files_have_matching_lts_flavor() {
-        assert_eq!(split_boot_filename("vmlinuz-lts"), Some(("vmlinuz", "lts")));
+    fn boot_files_preserve_full_kernel_release() {
+        let release = "6.12.40-0-lts";
         assert_eq!(
-            split_boot_filename("initramfs-lts"),
-            Some(("initramfs", "lts"))
+            split_boot_filename("vmlinuz-6.12.40-0-lts"),
+            Some(("vmlinuz", release))
+        );
+        assert_eq!(
+            split_boot_filename("initramfs-6.12.40-0-lts"),
+            Some(("initramfs", release))
         );
     }
 
     #[test]
-    fn alpine_initramfs_path_uses_kernel_flavor() {
+    fn alpine_initramfs_path_uses_full_kernel_release() {
         assert_eq!(
             alpine_initramfs_path("6.12.40-0-lts").unwrap(),
-            PathBuf::from("/boot/initramfs-lts")
+            PathBuf::from("/boot/initramfs-6.12.40-0-lts")
         );
-        assert!(alpine_initramfs_path("6.12.40").is_err());
+        assert!(alpine_initramfs_path("").is_err());
+    }
+
+    #[test]
+    fn list_kernels_reports_full_releases_for_all_boot_file_styles() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let rootfs = std::env::temp_dir().join(format!(
+            "qoc-list-full-releases-{}-{unique}",
+            std::process::id()
+        ));
+        let boot = rootfs.join("boot");
+        std::fs::create_dir_all(&boot).unwrap();
+
+        for file in [
+            "vmlinuz-6.1.0-debian",
+            "initrd.img-6.1.0-debian",
+            "vmlinuz-6.12.40-0-lts",
+            "initramfs-6.12.40-0-lts",
+            "vmlinuz-6.15.1-arch1-1",
+            "initramfs-6.15.1-arch1-1.img",
+        ] {
+            std::fs::write(boot.join(file), "").unwrap();
+        }
+
+        assert_eq!(
+            list_kernels(&rootfs).unwrap(),
+            ["6.1.0-debian", "6.12.40-0-lts", "6.15.1-arch1-1"]
+        );
+        std::fs::remove_dir_all(rootfs).unwrap();
     }
 }

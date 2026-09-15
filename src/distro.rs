@@ -378,6 +378,9 @@ mod tests {
         assert!(install.contains("linux-firmware-none"));
         assert!(install.contains("mkinitfs"));
         assert!(install.contains("openssh-server-common-openrc"));
+        assert!(install.contains("mv /boot/vmlinuz-lts \"/boot/vmlinuz-$KVER\""));
+        assert!(install.contains("mv /boot/config-lts \"/boot/config-$KVER\""));
+        assert!(install.contains("-o \"/boot/initramfs-$KVER\" \"$KVER\""));
         assert!(system.contains("rc-update add networking boot"));
         assert!(system.contains("rc-update add modules boot"));
         assert!(system.contains("rc-update add sshd default"));
@@ -385,6 +388,15 @@ mod tests {
         assert!(system.contains("vmxnet3"));
         assert!(system.contains("seq 0 13"));
         assert!(!system.contains("systemctl"));
+    }
+
+    #[test]
+    fn arch_script_uses_full_kernel_release_for_boot_files() {
+        let install = Arch.install_and_kernel_script();
+
+        assert!(install.contains("/boot/vmlinuz-$KVER"));
+        assert!(install.contains("/boot/initramfs-$KVER.img"));
+        assert!(install.contains("rm -f /boot/vmlinuz-linux /boot/initramfs-linux.img"));
     }
 }
 
@@ -467,7 +479,13 @@ KVER=$(find /lib/modules -mindepth 1 -maxdepth 1 -type d | head -n 1)
 KVER=${KVER##*/}
 test -n "$KVER"
 echo KVER: "$KVER"
-mkinitfs -c /etc/mkinitfs/mkinitfs.conf "$KVER""#
+test -f /boot/vmlinuz-lts
+mv /boot/vmlinuz-lts "/boot/vmlinuz-$KVER"
+if [ -f /boot/config-lts ]; then
+    mv /boot/config-lts "/boot/config-$KVER"
+fi
+rm -f /boot/initramfs-lts
+mkinitfs -c /etc/mkinitfs/mkinitfs.conf -o "/boot/initramfs-$KVER" "$KVER""#
             .to_string()
     }
 
@@ -505,7 +523,7 @@ impl Distro for Arch {
     }
 
     fn initramfs_prefix(&self) -> &str {
-        "initramfs-linux"
+        "initramfs-"
     }
 
     fn proot_binds(&self) -> &[&str] {
@@ -568,11 +586,12 @@ echo linux images available:
 ls /usr/lib/modules/*/vmlinuz
 KVER=$(ls /usr/lib/modules/*/vmlinuz | cut -f5 -d'/')
 echo KVER: $KVER
-cp -v /usr/lib/modules/$KVER/vmlinuz /boot/vmlinuz-linux
+cp -v "/usr/lib/modules/$KVER/vmlinuz" "/boot/vmlinuz-$KVER"
 sed -i 's/^MODULES=.*/MODULES=(virtio virtio_pci virtiofs)/' /etc/mkinitcpio.conf
 grep virtio /etc/mkinitcpio.conf
 depmod $KVER
-mkinitcpio -k $KVER -c /etc/mkinitcpio.conf -g /boot/initramfs-linux.img
+mkinitcpio -k "$KVER" -c /etc/mkinitcpio.conf -g "/boot/initramfs-$KVER.img"
+rm -f /boot/vmlinuz-linux /boot/initramfs-linux.img
 systemctl mask systemd-firstboot.service
 ln -sf /usr/share/zoneinfo/UTC /etc/localtime
 echo 'LANG=en_GB.UTF-8' > /etc/locale.conf
